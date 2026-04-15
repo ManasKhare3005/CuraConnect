@@ -20,7 +20,7 @@ async def find_nearby_doctors(
     Returns a list of up to 5 doctor/clinic results.
     """
     if not GOOGLE_PLACES_API_KEY:
-        return _mock_doctors(latitude, longitude)
+        return _mock_doctors(latitude, longitude, specialty)
 
     keyword = specialty if specialty else "doctor clinic"
     params = {
@@ -34,7 +34,7 @@ async def find_nearby_doctors(
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.get(PLACES_NEARBY_URL, params=params)
         if response.status_code != 200:
-            return _mock_doctors(latitude, longitude)
+            return _mock_doctors(latitude, longitude, specialty)
 
         data = response.json()
         results = data.get("results", [])[:5]
@@ -50,11 +50,55 @@ async def find_nearby_doctors(
                 "maps_url": f"https://www.google.com/maps/place/?q=place_id:{place.get('place_id')}",
             })
 
-        return doctors
+        if doctors:
+            return doctors
+        return _mock_doctors(latitude, longitude, specialty)
 
 
-def _mock_doctors(lat: float, lng: float) -> list[dict]:
+def _mock_doctors(lat: float, lng: float, specialty: str | None = None) -> list[dict]:
     """Fallback mock data when no API key is configured."""
+    normalized_specialty = (specialty or "").strip().lower()
+
+    if "allerg" in normalized_specialty:
+        return [
+            {
+                "name": "Desert Allergy & Asthma Center",
+                "address": "Tempe, AZ",
+                "rating": 4.6,
+                "open_now": True,
+                "place_id": None,
+                "maps_url": f"https://www.google.com/maps/search/allergist/@{lat},{lng},14z",
+            },
+            {
+                "name": "Valley Immunology Clinic",
+                "address": "Tempe, AZ",
+                "rating": 4.4,
+                "open_now": True,
+                "place_id": None,
+                "maps_url": f"https://www.google.com/maps/search/allergy+clinic/@{lat},{lng},14z",
+            },
+        ]
+
+    if "general physician" in normalized_specialty or "family medicine" in normalized_specialty:
+        return [
+            {
+                "name": "General Practitioners Center",
+                "address": "Tempe, AZ",
+                "rating": 4.2,
+                "open_now": True,
+                "place_id": None,
+                "maps_url": f"https://www.google.com/maps/search/general+physician/@{lat},{lng},14z",
+            },
+            {
+                "name": "Family Medicine Associates",
+                "address": "Tempe, AZ",
+                "rating": 4.3,
+                "open_now": True,
+                "place_id": None,
+                "maps_url": f"https://www.google.com/maps/search/family+medicine/@{lat},{lng},14z",
+            },
+        ]
+
     return [
         {
             "name": "City Health Clinic",

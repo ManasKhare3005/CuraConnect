@@ -6,7 +6,6 @@ import re
 from math import isclose
 from typing import Any
 
-from groq import Groq
 from dotenv import load_dotenv
 
 from database import db as database
@@ -16,8 +15,6 @@ from services.geocoding import geocode_address
 
 load_dotenv()
 
-client = Groq(api_key=os.getenv("GROQ_API_KEY", ""))
-MODEL = "llama-3.3-70b-versatile"
 INLINE_TOOL_CALL_RE = re.compile(r"<function=(\w+)(.*?)</function>", flags=re.DOTALL)
 
 SYSTEM_PROMPT_BASE = """You are a warm, professional health assistant voice agent named Aria for CuraConnect.
@@ -170,6 +167,9 @@ class ConversationSession:
             "height_cm": None,
             "address": None,
         }
+        self.symptoms: set[str] = set()
+        self.doctors_shared: bool = False
+        self.prompted_missing_fields: set[str] = set()
 
     def _build_system_prompt(self) -> str:
         profile_lines = []
@@ -244,68 +244,531 @@ class ConversationSession:
         }
 
     async def _run_agent_loop(self) -> str:
-        loop_messages = [{"role": "system", "content": self._build_system_prompt()}] + list(self.messages)
+        user_text = self._latest_user_text()
+        return await self._run_scripted_assistant(user_text)
 
-        while True:
-            loop_messages[0]["content"] = self._build_system_prompt()
+    async def _run_scripted_assistant(self, user_text: str) -> str:
+        entities = self._extract_entities_from_user_text(user_text)
+        stop_requested = bool(entities.get("stop_requested"))
+        blood_pressure_mentioned = bool(entities.get("blood_pressure_mentioned"))
+        heart_rate_mentioned = bool(entities.get("heart_rate_mentioned"))
+        updates: dict[str, Any] = {
+            "profile_changed": {},
+            "symptoms_added": [],
+            "vitals_logged": [],
+            "address_status": None,
+            "blood_pressure": None,
+            "heart_rate": None,
+            "existing_details": [],
+        }
 
-            try:
-                response = await asyncio.to_thread(
-                    client.chat.completions.create,
-                    model=MODEL,
-                    messages=loop_messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
-                    max_tokens=512,
-                )
-            except Exception as exc:
-                recovered_tool = self._extract_failed_tool_call(exc)
-                if recovered_tool:
-                    fn_name, fn_args = recovered_tool
-                    result = await self._execute_tool(fn_name, fn_args)
-                    return self._tool_recovery_response(fn_name, fn_args, result)
-                if self._is_rate_limit_error(exc):
-                    return (
-                        "I'm temporarily hitting a service limit right now. "
-                        "Please retry in a minute, and we can continue from where we left off."
+        profile_inputs: dict[str, Any] = {}
+        if entities.get("name"):
+            profile_inputs["name"] = entities["name"]
+        if entities.get("age") is not None:
+            profile_inputs["age"] = entities["age"]
+        if entities.get("weight_kg") is not None:
+            profile_inputs["weight_kg"] = entities["weight_kg"]
+        if entities.get("height_cm") is not None:
+            profile_inputs["height_cm"] = entities["height_cm"]
+
+        has_structured_data = bool(profile_inputs) or bool(entities.get("address")) or bool(entities.get("symptoms"))
+
+        if profile_inputs:
+            profile_result = await self._tool_set_user_profile(profile_inputs)
+            if isinstance(profile_result, dict):
+                updates["profile_changed"] = profile_result.get("changed") or {}
+
+        changed = updates["profile_changed"]
+        for key in ("weight_kg", "height_cm", "address"):
+            if key in changed and key in self.prompted_missing_fields:
+                self.prompted_missing_fields.remove(key)
+
+        if entities.get("name") and self.profile.get("name") == entities["name"] and "name" not in changed:
+            updates["existing_details"].append(f"I already have your name as {self.profile.get('name')}.")
+        if entities.get("age") is not None and self.profile.get("age") == entities["age"] and "age" not in changed:
+            updates["existing_details"].append(f"I already have your age as {self.profile.get('age')}.")
+        if entities.get("weight_kg") is not None and "weight_kg" not in changed:
+            current_weight = self.profile.get("weight_kg")
+            if isinstance(current_weight, (int, float)) and isclose(
+                float(current_weight), float(entities["weight_kg"]), rel_tol=0.0, abs_tol=0.01
+            ):
+                updates["existing_details"].append(f"I already have your weight as {float(current_weight):g} kg.")
+        if entities.get("height_cm") is not None and "height_cm" not in changed:
+            current_height = self.profile.get("height_cm")
+            if isinstance(current_height, (int, float)) and isclose(
+                float(current_height), float(entities["height_cm"]), rel_tol=0.0, abs_tol=0.1
+            ):
+                updates["existing_details"].append(f"I already have your height as {float(current_height):g} cm.")
+
+        address = entities.get("address")
+        if address:
+            address_result = await self.set_address(address)
+            updates["address_status"] = address_result.get("status")
+            updates["profile_changed"]["address"] = self.profile.get("address")
+            if updates["address_status"] == "ok" and "address" in self.prompted_missing_fields:
+                self.prompted_missing_fields.remove("address")
+
+        for symptom in entities.get("symptoms", []):
+            if symptom in self.symptoms:
+                continue
+            self.symptoms.add(symptom)
+            updates["symptoms_added"].append(symptom)
+            vital_result = await self._tool_log_vital(
+                {
+                    "vital_type": "symptom",
+                    "value": symptom,
+                    "notes": "User-reported symptom",
+                }
+            )
+            updates["vitals_logged"].append(vital_result)
+
+        if entities.get("symptoms") and not updates["symptoms_added"]:
+            known = ", ".join(sorted(self.symptoms))
+            if known:
+                updates["existing_details"].append(f"I still have your symptoms noted: {known}.")
+
+        blood_pressure = entities.get("blood_pressure")
+        if blood_pressure:
+            await self._tool_log_vital(
+                {
+                    "vital_type": "blood_pressure",
+                    "value": blood_pressure,
+                    "unit": "mmHg",
+                }
+            )
+            updates["vitals_logged"].append({"vital_type": "blood_pressure", "value": blood_pressure})
+            updates["blood_pressure"] = blood_pressure
+            has_structured_data = True
+
+        heart_rate = entities.get("heart_rate")
+        if heart_rate is not None:
+            await self._tool_log_vital(
+                {
+                    "vital_type": "heart_rate",
+                    "value": str(heart_rate),
+                    "unit": "bpm",
+                }
+            )
+            updates["vitals_logged"].append({"vital_type": "heart_rate", "value": str(heart_rate)})
+            updates["heart_rate"] = heart_rate
+            has_structured_data = True
+
+        clarifications: list[str] = []
+        if blood_pressure_mentioned and not blood_pressure:
+            clarifications.append(
+                "I could not read that blood pressure clearly. Please share it as two numbers, like 122 over 78."
+            )
+        if heart_rate_mentioned and heart_rate is None:
+            clarifications.append(
+                "I could not read the heart rate clearly. Please share one number in bpm, like 72."
+            )
+
+        if stop_requested and not has_structured_data and not clarifications:
+            return "No problem. You are all set for now. If anything changes, I am here to help."
+
+        doctors_requested = bool(entities.get("doctor_request"))
+        auto_doctor_from_new_address = (
+            bool(address)
+            and updates.get("address_status") == "ok"
+            and bool(self.symptoms)
+            and not self.doctors_shared
+        )
+        should_find_doctors = doctors_requested or auto_doctor_from_new_address
+        doctor_result = None
+        if should_find_doctors and (self.profile.get("address") or self.address_location or self.location):
+            doctor_input: dict[str, Any] = {}
+            if self.profile.get("address"):
+                doctor_input["address"] = self.profile["address"]
+            specialties = self._recommended_specialties()
+            if specialties:
+                doctor_input["specialties"] = specialties
+                doctor_input["specialty"] = specialties[0]
+            doctor_result = await self._tool_find_doctors(doctor_input)
+            if isinstance(doctor_result, dict) and doctor_result.get("status") == "found":
+                self.doctors_shared = True
+
+        response_parts: list[str] = []
+        response_parts.extend(self._build_acknowledgements(updates))
+
+        if entities.get("severe_flag"):
+            response_parts.append(
+                "Because you mentioned breathing trouble, please seek urgent care immediately if it worsens."
+            )
+
+        if clarifications:
+            response_parts.extend(clarifications)
+            merged = " ".join(part.strip() for part in response_parts if part and part.strip())
+            return merged or clarifications[0]
+
+        if isinstance(doctor_result, dict):
+            if doctor_result.get("status") == "found":
+                specialties = doctor_result.get("specialties") or []
+                if specialties:
+                    readable = self._format_specialty_list(specialties)
+                    response_parts.append(
+                        f"I found {doctor_result.get('count', 0)} {readable} options and shared them on your screen."
                     )
-                print(f"Agent loop error: {exc}")
-                return "I ran into a temporary issue processing that. Please try your last message again."
-
-            message = response.choices[0].message
-
-            if not message.tool_calls:
-                content = message.content or ""
-                cleaned_text, inline_calls = self._extract_inline_tool_calls(content)
-
-                if inline_calls:
-                    last_result = {}
-                    for fn_name, fn_args in inline_calls:
-                        last_result = await self._execute_tool(fn_name, fn_args)
-
-                    if cleaned_text:
-                        return cleaned_text
-
-                    last_fn_name, last_fn_args = inline_calls[-1]
-                    return self._tool_recovery_response(last_fn_name, last_fn_args, last_result)
-
-                return content
-
-            loop_messages.append(message)
-
-            for tool_call in message.tool_calls:
-                fn_name = tool_call.function.name
-                fn_args = json.loads(tool_call.function.arguments)
-
-                result = await self._execute_tool(fn_name, fn_args)
-
-                loop_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(result),
-                    }
+                else:
+                    response_parts.append(
+                        f"I found {doctor_result.get('count', 0)} relevant doctors and shared them on your screen."
+                    )
+            elif doctor_result.get("status") == "no_results":
+                response_parts.append(
+                    "I could not find enough symptom-matched doctors from that search yet, but I can refine it."
                 )
+            elif doctor_result.get("status") == "error":
+                response_parts.append("Please share your full address so I can recommend nearby doctors accurately.")
+        elif should_find_doctors and not self.profile.get("address"):
+            response_parts.append("Please share your full address so I can find nearby doctors for you.")
+
+        if stop_requested:
+            response_parts.append("No problem. You are all set for now. If anything changes, I am here to help.")
+            merged = " ".join(part.strip() for part in response_parts if part and part.strip())
+            return merged
+
+        follow_up = self._next_scripted_question()
+        if follow_up:
+            response_parts.append(follow_up)
+
+        merged = " ".join(part.strip() for part in response_parts if part and part.strip())
+        return merged or "I am here whenever you want to update any health detail."
+
+    def _build_acknowledgements(self, updates: dict[str, Any]) -> list[str]:
+        parts: list[str] = []
+        changed = updates.get("profile_changed") or {}
+
+        if "name" in changed and "age" in changed:
+            parts.append(f"Nice to meet you, {self.profile.get('name')}. I saved your age as {self.profile.get('age')}.")
+        elif "name" in changed:
+            parts.append(f"Nice to meet you, {self.profile.get('name')}.")
+        elif "age" in changed:
+            parts.append(f"I saved your age as {self.profile.get('age')}.")
+
+        if "weight_kg" in changed:
+            parts.append(f"I logged your weight as {changed['weight_kg']:g} kg.")
+        if "height_cm" in changed:
+            parts.append(f"I noted your height as {changed['height_cm']:g} cm.")
+        if updates.get("blood_pressure"):
+            parts.append(f"I logged your blood pressure as {updates['blood_pressure']} mmHg.")
+        if updates.get("heart_rate") is not None:
+            parts.append(f"I logged your heart rate as {updates['heart_rate']} bpm.")
+
+        symptoms_added = updates.get("symptoms_added") or []
+        if symptoms_added:
+            readable = ", ".join(symptoms_added)
+            parts.append(f"I noted your symptoms: {readable}.")
+
+        if updates.get("address_status") == "ok":
+            parts.append("I saved your address.")
+        elif updates.get("address_status") == "unresolved":
+            parts.append("I could not fully confirm that address yet.")
+
+        parts.extend(updates.get("existing_details") or [])
+
+        return parts
+
+    def _next_scripted_question(self) -> str:
+        if not self.profile.get("name"):
+            return "What name should I use for you?"
+        if self.profile.get("age") is None:
+            return f"Thanks {self.profile.get('name')}. What is your age?"
+        if not self.symptoms:
+            return "How are you feeling today, and do you have any symptoms?"
+        if self.profile.get("weight_kg") is None:
+            if "weight_kg" not in self.prompted_missing_fields:
+                self.prompted_missing_fields.add("weight_kg")
+                return "Do you know your current weight in kilograms?"
+            return ""
+        if self.profile.get("height_cm") is None:
+            if "height_cm" not in self.prompted_missing_fields:
+                self.prompted_missing_fields.add("height_cm")
+                return "If you know it, what is your height in centimeters?"
+            return ""
+        if not self.profile.get("address"):
+            if "address" not in self.prompted_missing_fields:
+                self.prompted_missing_fields.add("address")
+                return "Can you share your address so I can recommend nearby doctors if needed?"
+            return ""
+        if self.symptoms and not self.doctors_shared:
+            specialties = self._recommended_specialties()
+            if specialties:
+                readable = self._format_specialty_list(specialties)
+                return f"If you want, I can find {readable} based on your saved address."
+            return "If you want, I can find doctors based on your saved address."
+        if not any(vital in self.logged_vital_types for vital in {"blood_pressure", "heart_rate", "temperature"}):
+            return "If you know a reading like blood pressure, heart rate, or temperature, I can log it."
+        return "I have your key details saved. If anything changes, just tell me and I will update it."
+
+    def _recommended_specialties(self) -> list[str]:
+        specialties: list[str] = []
+        allergy_symptoms = {"allergies", "hives", "rash", "itching", "sneezing"}
+
+        if any(symptom in self.symptoms for symptom in allergy_symptoms):
+            specialties.append("allergist")
+            specialties.append("general physician")
+        elif self.symptoms:
+            specialties.append("general physician")
+
+        deduped: list[str] = []
+        for specialty in specialties:
+            if specialty not in deduped:
+                deduped.append(specialty)
+        return deduped
+
+    def _format_specialty_list(self, specialties: list[str]) -> str:
+        if not specialties:
+            return "doctor"
+        if len(specialties) == 1:
+            return specialties[0]
+        if len(specialties) == 2:
+            return f"{specialties[0]} and {specialties[1]}"
+        return ", ".join(specialties[:-1]) + f", and {specialties[-1]}"
+
+    def _extract_entities_from_user_text(self, text: str) -> dict[str, Any]:
+        return {
+            "name": self._extract_name(text),
+            "age": self._extract_age(text),
+            "weight_kg": self._extract_weight_kg(text),
+            "height_cm": self._extract_height_cm(text),
+            "address": self._extract_address(text),
+            "symptoms": self._extract_symptoms(text),
+            "blood_pressure": self._extract_blood_pressure(text),
+            "heart_rate": self._extract_heart_rate(text),
+            "blood_pressure_mentioned": self._mentions_blood_pressure(text),
+            "heart_rate_mentioned": self._mentions_heart_rate(text),
+            "doctor_request": self._is_doctor_request(text),
+            "severe_flag": self._mentions_severe_symptom(text),
+            "stop_requested": self._is_stop_request(text),
+        }
+
+    def _extract_name(self, text: str) -> str | None:
+        patterns = [
+            r"\bmy name is\s+([a-zA-Z][a-zA-Z' -]{0,40})",
+            r"\bthis is\s+([a-zA-Z][a-zA-Z' -]{0,40})",
+        ]
+        stop_words = {"and", "age", "is", "i", "im", "i'm", "my"}
+
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1).strip()
+            candidate = re.split(r"\b(?:and|age|i am|i'm|im)\b", candidate, maxsplit=1, flags=re.IGNORECASE)[0]
+            words = [w for w in re.findall(r"[a-zA-Z][a-zA-Z'-]*", candidate) if w.lower() not in stop_words]
+            if words:
+                return " ".join(words[:2]).title()
+        return None
+
+    def _extract_age(self, text: str) -> int | None:
+        patterns = [
+            r"\bage(?:\s*(?:is|=|:|around|about|would be|would be something around))?\s*(\d{1,3})\b",
+            r"\bi am\s+(\d{1,3})\b",
+            r"\bi'?m\s+(\d{1,3})\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            age = int(match.group(1))
+            if 1 <= age <= 120:
+                return age
+        return None
+
+    def _extract_weight_kg(self, text: str) -> float | None:
+        patterns = [
+            r"\bweight(?:\s*(?:is|=|:|around|about|would be|would be something around))?\s*(\d{2,3}(?:\.\d+)?)\s*(?:kg|kgs|kilograms?)?\b",
+            r"\b(\d{2,3}(?:\.\d+)?)\s*(?:kg|kgs|kilograms?)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = float(match.group(1))
+            if 20 <= value <= 350:
+                return value
+        return None
+
+    def _extract_height_cm(self, text: str) -> float | None:
+        patterns = [
+            r"\bheight(?:\s*(?:is|=|:|around|about|would be|would be something around))?\s*(\d{2,3}(?:\.\d+)?)\s*(?:cm|centimeters?)?\b",
+            r"\b(\d{2,3}(?:\.\d+)?)\s*(?:cm|centimeters?)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = float(match.group(1))
+            if 80 <= value <= 260:
+                return value
+        return None
+
+    def _extract_address(self, text: str) -> str | None:
+        patterns = [
+            r"\bmy address(?:\s+is|\s+would be|:)?\s+(.+)",
+            r"\baddress(?:\s+is|:)?\s+(.+)",
+            r"\bit(?:'s| is)\s+(.+)",
+            r"^\s*is\s+(.+)",
+        ]
+
+        candidates: list[str] = []
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                candidates.append(match.group(1).strip())
+
+        if not candidates and self._looks_like_address(text):
+            candidates.append(text.strip())
+
+        for candidate in candidates:
+            normalized = self._normalize_address_candidate(candidate)
+            if self._looks_like_address(normalized):
+                return normalized
+        return None
+
+    def _normalize_address_candidate(self, address: str) -> str:
+        cleaned = re.sub(
+            r"^(?:my address(?: is| would be)?|address(?: is)?|it is|it's|is)\s+",
+            "",
+            address.strip(),
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^\s*one\s+(0[0-9]{2,4})\b", lambda m: f"1{m.group(1)}", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,\n\t")
+        return cleaned
+
+    def _looks_like_address(self, text: str) -> bool:
+        lowered = text.lower()
+        has_number = bool(re.search(r"\d{2,6}", lowered)) or bool(
+            re.search(r"\b(one|two|three|four|five|six|seven|eight|nine)\b", lowered)
+        )
+        hints = (
+            "street",
+            "st",
+            "road",
+            "rd",
+            "drive",
+            "dr",
+            "avenue",
+            "ave",
+            "lane",
+            "ln",
+            "boulevard",
+            "blvd",
+            "way",
+            "court",
+            "ct",
+            "tempe",
+            "arizona",
+            "az",
+            "phoenix",
+            "mesa",
+            "scottsdale",
+        )
+        has_hint = any(re.search(rf"\b{re.escape(hint)}\b", lowered) for hint in hints)
+        return has_number and has_hint
+
+    def _extract_symptoms(self, text: str) -> list[str]:
+        lowered = text.lower()
+        symptom_aliases = {
+            "allergy": "allergies",
+            "allergies": "allergies",
+            "hives": "hives",
+            "rash": "rash",
+            "itching": "itching",
+            "sneezing": "sneezing",
+            "cough": "cough",
+            "fever": "fever",
+            "headache": "headache",
+            "breathlessness": "breathlessness",
+            "breathless": "breathlessness",
+            "shortness of breath": "breathlessness",
+            "breathing difficulty": "breathlessness",
+        }
+        detected: list[str] = []
+        for key, canonical in symptom_aliases.items():
+            if key in lowered and canonical not in detected:
+                detected.append(canonical)
+        return detected
+
+    def _extract_blood_pressure(self, text: str) -> str | None:
+        normalized = text.lower()
+        normalized = re.sub(r"\b(\d)\s*[:]\s*(\d{2})\b", r"\1\2", normalized)
+        normalized = re.sub(r"\b(\d{2})\s*[:]\s*(\d)\b", r"\1\2", normalized)
+        normalized = re.sub(r"\bover\b", "/", normalized)
+        normalized = re.sub(r"\bby\b", "/", normalized)
+
+        match = re.search(r"\b(\d{2,3})\s*/\s*(\d{2,3})\b", normalized, flags=re.IGNORECASE)
+        if match:
+            systolic = int(match.group(1))
+            diastolic = int(match.group(2))
+            if 60 <= systolic <= 250 and 40 <= diastolic <= 150:
+                return f"{systolic}/{diastolic}"
+
+        if self._mentions_blood_pressure(normalized):
+            after_bp = normalized.split("blood pressure", 1)[1] if "blood pressure" in normalized else normalized
+            numbers = re.findall(r"\d{2,3}", after_bp)
+            if len(numbers) >= 2:
+                systolic = int(numbers[0])
+                diastolic = int(numbers[1])
+                if 60 <= systolic <= 250 and 40 <= diastolic <= 150:
+                    return f"{systolic}/{diastolic}"
+        return None
+
+    def _extract_heart_rate(self, text: str) -> int | None:
+        lowered = text.lower()
+        segment = lowered
+
+        focused = re.search(r"\b(?:heart rate|pulse)\b(.*)", lowered, flags=re.IGNORECASE)
+        if focused:
+            segment = focused.group(1)
+        elif "bpm" not in lowered:
+            return None
+
+        numbers = re.findall(r"\d{2,4}", segment)
+        for number in numbers:
+            value = int(number)
+            if 35 <= value <= 220:
+                return value
+
+            if len(number) == 4:
+                first = int(number[:2])
+                second = int(number[2:])
+                if 35 <= first <= 220 and 35 <= second <= 220:
+                    return round((first + second) / 2)
+
+        return None
+
+    def _mentions_blood_pressure(self, text: str) -> bool:
+        lowered = text.lower()
+        return "blood pressure" in lowered or bool(re.search(r"\bbp\b", lowered))
+
+    def _mentions_heart_rate(self, text: str) -> bool:
+        lowered = text.lower()
+        return "heart rate" in lowered or "pulse" in lowered
+
+    def _is_stop_request(self, text: str) -> bool:
+        lowered = text.lower()
+        stop_patterns = (
+            r"\bno thanks\b",
+            r"\bno thank you\b",
+            r"\bthat'?s all\b",
+            r"\bnothing else\b",
+            r"\bi'?m done\b",
+            r"\bim done\b",
+            r"\bno more\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in stop_patterns)
+
+    def _is_doctor_request(self, text: str) -> bool:
+        lowered = text.lower()
+        keywords = ("doctor", "doctors", "clinic", "nearby", "recommend", "hospital", "appointment")
+        return any(keyword in lowered for keyword in keywords)
+
+    def _mentions_severe_symptom(self, text: str) -> bool:
+        lowered = text.lower()
+        severe_terms = ("chest pain", "shortness of breath", "breathlessness", "difficulty breathing")
+        return any(term in lowered for term in severe_terms)
 
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> Any:
         if tool_name == "log_vital":
@@ -610,6 +1073,7 @@ class ConversationSession:
         lat = inputs.get("latitude")
         lng = inputs.get("longitude")
         specialty = inputs.get("specialty")
+        specialties_input = inputs.get("specialties")
         radius_km = inputs.get("radius_km", 5)
         address = inputs.get("address")
         location_source = None
@@ -648,7 +1112,38 @@ class ConversationSession:
                 "message": "Address or reliable location is required to recommend nearby doctors.",
             }
 
-        doctors = await find_nearby_doctors(float(lat), float(lng), specialty, int(float(radius_km) * 1000))
+        specialties: list[str] = []
+        if isinstance(specialties_input, list):
+            specialties = [str(item).strip() for item in specialties_input if str(item).strip()]
+        if not specialties and isinstance(specialty, str) and specialty.strip():
+            specialties = [specialty.strip()]
+        if not specialties:
+            specialties = [""]
+
+        merged: list[dict] = []
+        seen: set[str] = set()
+        for current_specialty in specialties:
+            query_specialty = current_specialty if current_specialty else None
+            results = await find_nearby_doctors(
+                float(lat),
+                float(lng),
+                query_specialty,
+                int(float(radius_km) * 1000),
+            )
+            for doctor in results:
+                key = str(doctor.get("place_id") or f"{doctor.get('name')}|{doctor.get('address')}")
+                if key in seen:
+                    continue
+                seen.add(key)
+                if query_specialty:
+                    doctor["recommended_for"] = query_specialty
+                merged.append(doctor)
+                if len(merged) >= 8:
+                    break
+            if len(merged) >= 8:
+                break
+
+        doctors = merged
         self.events.append({"type": "doctors_found", "doctors": doctors})
 
         if not doctors:
@@ -663,6 +1158,7 @@ class ConversationSession:
             "count": len(doctors),
             "doctors": doctors,
             "source": location_source,
+            "specialties": [s for s in specialties if s],
         }
 
     def identify_user(self, name: str, age: int | None = None):
