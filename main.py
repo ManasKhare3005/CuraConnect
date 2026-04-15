@@ -1,9 +1,6 @@
-import os
 import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, RedirectResponse
 from dotenv import load_dotenv
 
 from database.db import init_db
@@ -20,18 +17,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="CuraConnect Voice Assistant", lifespan=lifespan)
 
-# Serve static files and the frontend
-app.mount("/static", StaticFiles(directory="web/static"), name="static")
-
 
 @app.get("/")
 async def root():
-    return FileResponse("web/index.html")
-
-
-@app.get("/favicon.ico")
-async def favicon():
-    return RedirectResponse(url="/static/favicon.svg", status_code=307)
+    return {
+        "app": "CuraConnect Backend",
+        "status": "ok",
+        "message": "React frontend is now standalone. Run it from the frontend folder.",
+    }
 
 
 @app.websocket("/ws")

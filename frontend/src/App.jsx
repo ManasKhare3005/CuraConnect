@@ -1,4 +1,4 @@
-const { useEffect, useRef, useState } = React;
+import { useEffect, useRef, useState } from "react";
 
 const VITAL_LABELS = {
   blood_pressure: "Blood Pressure",
@@ -13,6 +13,20 @@ const VITAL_LABELS = {
 };
 
 const MIN_CONFIDENCE_FOR_AUTO_SEND = 0.45;
+
+function resolveWebSocketUrl() {
+  const configured = (import.meta.env.VITE_WS_URL || "").trim();
+  if (configured) {
+    return configured;
+  }
+
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const host =
+    window.location.port === "5173"
+      ? window.location.hostname + ":8000"
+      : window.location.host;
+  return protocol + "://" + host + "/ws";
+}
 
 function App() {
   const [status, setStatus] = useState({ mode: "", text: "Disconnected" });
@@ -574,8 +588,7 @@ function App() {
 
     const micSetupResult = await configureEnhancedMicrophone();
 
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(protocol + "://" + window.location.host + "/ws");
+    const ws = new WebSocket(resolveWebSocketUrl());
     wsRef.current = ws;
 
     ws.onopen = function () {
@@ -866,4 +879,4 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+export default App;
