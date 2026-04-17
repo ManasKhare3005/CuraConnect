@@ -132,6 +132,8 @@ function App() {
   const micDeniedRef = useRef(false);
   const recognitionResultHandledRef = useRef(false);
   const lastSubmittedMessageRef = useRef({ normalized: "", timestamp: 0, source: "" });
+  const autoListenArmedRef = useRef(false);
+  const recognitionStartInFlightRef = useRef(false);
 
   function handleAuth(token, user) {
     localStorage.setItem("cc_token", token);
@@ -149,6 +151,7 @@ function App() {
     setVitals([]);
     setDoctors([]);
     setMessages([]);
+    autoListenArmedRef.current = false;
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
         wsRef.current.send(JSON.stringify({ type: "end_session" }));
@@ -178,6 +181,7 @@ function App() {
   const micSourceRef = useRef(null);
   const micAnalyserRef = useRef(null);
   const micLevelTimerRef = useRef(null);
+  const micReleaseTimerRef = useRef(null);
   const ambientNoiseLevelRef = useRef(0);
   const mediaRecorderRef = useRef(null);
   const recordingChunksRef = useRef([]);
@@ -392,7 +396,27 @@ function App() {
     });
   }
 
+  function clearMicReleaseTimer() {
+    if (micReleaseTimerRef.current) {
+      clearTimeout(micReleaseTimerRef.current);
+      micReleaseTimerRef.current = null;
+    }
+  }
+
+  function scheduleMicRelease(delayMs = 800) {
+    clearMicReleaseTimer();
+    micReleaseTimerRef.current = window.setTimeout(function () {
+      micReleaseTimerRef.current = null;
+      if (isListeningRef.current || isSpeakingRef.current || awaitingAgentReplyRef.current) {
+        return;
+      }
+      stopMicEnhancementPipeline();
+      syncInteractionState();
+    }, delayMs);
+  }
+
   function stopMicEnhancementPipeline() {
+    clearMicReleaseTimer();
     if (mediaRecorderRef.current) {
       try {
         if (mediaRecorderRef.current.state === "recording") {
@@ -502,6 +526,7 @@ function App() {
     }
 
     try {
+      clearMicReleaseTimer();
       const constraints = buildEnhancedAudioConstraints();
 
       if (!micStreamRef.current) {
@@ -587,10 +612,17 @@ function App() {
     }
 
     setMicEnabled(!isSpeakingRef.current);
+    const autoListenReady =
+      autoListenArmedRef.current &&
+      !isSpeakingRef.current &&
+      !isListeningRef.current &&
+      !awaitingAgentReplyRef.current;
     setMicHint(
       isSpeakingRef.current
         ? "Assistant is speaking..."
-        : "Auto-listen is ready. You can also tap the mic button."
+        : autoListenReady
+          ? "Auto-listen is ready for the next reply."
+          : "Tap the mic button when you want to speak."
     );
   }
 
@@ -805,7 +837,51 @@ function App() {
     updateStatus("connected", "Connected");
   }
 
+  async function startRecognitionSession(source = "manual") {
+    if (recognitionStartInFlightRef.current) {
+      return;
+    }
+    if (!recognitionRef.current || !canSpeakRef.current) {
+      return;
+    }
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    if (isSpeakingRef.current || isListeningRef.current || awaitingAgentReplyRef.current) {
+      return;
+    }
+
+    recognitionStartInFlightRef.current = true;
+    try {
+      const micSetupResult = await configureEnhancedMicrophone();
+      if (micSetupResult === "failed") {
+        setMicEnabled(false);
+        setMicHint("Mic access denied. Enable it in browser settings to use voice.");
+        setCanSpeak(false);
+        canSpeakRef.current = false;
+        return;
+      }
+
+      if (source === "auto") {
+        autoListenArmedRef.current = false;
+      }
+
+      recognitionRef.current.start();
+    } catch (error) {
+      scheduleMicRelease(200);
+      if (source === "manual") {
+        appendMessage("agent", "Voice input is busy. Try again in a second.");
+      }
+    } finally {
+      recognitionStartInFlightRef.current = false;
+    }
+  }
+
   function maybeAutoStartListening() {
+    if (!autoListenArmedRef.current) {
+      return;
+    }
+
     if (!canSpeakRef.current) {
       return;
     }
@@ -826,11 +902,7 @@ function App() {
       if (isSpeakingRef.current || isListeningRef.current || awaitingAgentReplyRef.current) {
         return;
       }
-      try {
-        recognitionRef.current.start();
-      } catch (error) {
-        // Ignore rapid re-start errors and keep manual voice button as fallback.
-      }
+      void startRecognitionSession("auto");
     }, 160);
   }
 
@@ -893,6 +965,7 @@ function App() {
 
     recognition.onstart = function () {
       recognitionResultHandledRef.current = false;
+      clearMicReleaseTimer();
       isListeningRef.current = true;
       setIsListening(true);
       updateStatus("listening", "Listening");
@@ -926,6 +999,7 @@ function App() {
       stopListeningUI();
 
       if (!finalTranscript) {
+        scheduleMicRelease();
         syncInteractionState();
         maybeAutoStartListening();
         return;
@@ -942,6 +1016,7 @@ function App() {
       recognitionResultHandledRef.current = false;
       stopListeningUI();
       stopVoiceSegmentCapture();
+      scheduleMicRelease();
 
       if (event.error === "not-allowed" || event.error === "audio-capture") {
         setMicEnabled(false);
@@ -964,6 +1039,7 @@ function App() {
     recognition.onend = function () {
       recognitionResultHandledRef.current = false;
       stopVoiceSegmentCapture();
+      scheduleMicRelease();
       if (isListeningRef.current) {
         stopListeningUI();
       }
@@ -1010,6 +1086,7 @@ function App() {
   }
 
   function endAndCleanup() {
+    autoListenArmedRef.current = false;
     if (recognitionRef.current) {
       try { recognitionRef.current.stop(); } catch (_) {}
     }
@@ -1033,6 +1110,13 @@ function App() {
       setTyping(false);
       appendMessage("agent", data.text || "");
       refreshConversationHistory();
+
+      // Arm one auto-listen turn after this assistant reply.
+      if (!data.session_complete) {
+        autoListenArmedRef.current = true;
+      } else {
+        autoListenArmedRef.current = false;
+      }
 
       if (data.session_complete) {
         // Play final audio, then close connection and release mic
@@ -1067,13 +1151,18 @@ function App() {
     if (data.type === "error") {
       awaitingAgentReplyRef.current = false;
       setTyping(false);
+      autoListenArmedRef.current = false;
       appendMessage("agent", "Something went wrong. Please try again.");
       syncInteractionState();
     }
   }
 
   async function connectSession() {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    if (
+      wsRef.current &&
+      (wsRef.current.readyState === WebSocket.OPEN ||
+        wsRef.current.readyState === WebSocket.CONNECTING)
+    ) {
       return;
     }
 
@@ -1092,10 +1181,7 @@ function App() {
         setConversationHistory(conversationsResult.value);
       }
     }
-    const [micSetupResult, healthChecks] = await Promise.all([
-      configureEnhancedMicrophone(),
-      Promise.allSettled([checkBackendHealth(), checkSttHealth()]),
-    ]);
+    const healthChecks = await Promise.allSettled([checkBackendHealth(), checkSttHealth()]);
     const sttHealthy = healthChecks[1] && healthChecks[1].status === "fulfilled";
     const sttHealthPayload = sttHealthy ? healthChecks[1].value : null;
     const transcribeEnabled = Boolean(sttHealthPayload && sttHealthPayload.transcribe_enabled);
@@ -1111,14 +1197,7 @@ function App() {
         recognitionRef.current = initRecognition();
       }
 
-      if (micSetupResult === "failed") {
-        setMicEnabled(false);
-        setCanSpeak(false);
-        canSpeakRef.current = false;
-        setMicHint("Mic access denied. Enable it in browser settings to use voice.");
-      } else {
-        setMicHint("Type or tap the mic to start.");
-      }
+      setMicHint("Type or tap the mic to start.");
 
       syncInteractionState();
 
@@ -1151,6 +1230,7 @@ function App() {
       isSpeakingRef.current = false;
       awaitingAgentReplyRef.current = false;
       sttTranscribeAvailableRef.current = false;
+      autoListenArmedRef.current = false;
 
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch (_) {}
@@ -1192,11 +1272,7 @@ function App() {
       return;
     }
 
-    try {
-      recognitionRef.current.start();
-    } catch (error) {
-      appendMessage("agent", "Voice input is busy. Try again in a second.");
-    }
+    void startRecognitionSession("manual");
   }
 
   function onSubmit(event) {

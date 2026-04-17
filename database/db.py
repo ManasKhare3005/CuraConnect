@@ -363,6 +363,10 @@ def get_conversation_history(
             else:
                 messages = messages_query.all()
 
+            # Ignore empty websocket sessions so users only see real conversations.
+            if not messages:
+                continue
+
             history.append(
                 {
                     "session_id": session.id,
