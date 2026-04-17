@@ -1,20 +1,22 @@
-import os
 import base64
+import logging
+import os
+
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 ELEVENLABS_MODEL = "eleven_turbo_v2_5"
 
+http_client: httpx.AsyncClient | None = None
+
 
 async def synthesize_speech(text: str) -> str | None:
-    """
-    Convert text to speech using ElevenLabs.
-    Returns base64-encoded MP3 audio, or None if TTS is unavailable.
-    """
     if not ELEVENLABS_API_KEY:
         return None
 
@@ -34,10 +36,15 @@ async def synthesize_speech(text: str) -> str | None:
         },
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    client = http_client or httpx.AsyncClient(timeout=30.0)
+    close_after = http_client is None
+    try:
         response = await client.post(url, headers=headers, json=payload)
         if response.status_code == 200:
             return base64.b64encode(response.content).decode("utf-8")
         else:
-            print(f"ElevenLabs error {response.status_code}: {response.text}")
+            logger.warning("ElevenLabs error %s: %s", response.status_code, response.text[:200])
             return None
+    finally:
+        if close_after:
+            await client.aclose()

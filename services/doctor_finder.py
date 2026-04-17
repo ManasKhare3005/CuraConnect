@@ -1,12 +1,18 @@
+import logging
 import os
+
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 PLACES_NEARBY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
 PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+
+http_client: httpx.AsyncClient | None = None
 
 
 async def find_nearby_doctors(
@@ -31,12 +37,21 @@ async def find_nearby_doctors(
         "key": GOOGLE_PLACES_API_KEY,
     }
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    client = http_client or httpx.AsyncClient(timeout=10.0)
+    close_after = http_client is None
+    try:
         response = await client.get(PLACES_NEARBY_URL, params=params)
         if response.status_code != 200:
+            logger.warning("Google Places HTTP %s: %s", response.status_code, response.text[:200])
             return _mock_doctors(latitude, longitude, specialty)
 
         data = response.json()
+        status = data.get("status")
+        # Google returns HTTP 200 even for REQUEST_DENIED / OVER_QUERY_LIMIT.
+        if status not in ("OK", "ZERO_RESULTS"):
+            logger.warning("Google Places status=%s error=%s", status, data.get("error_message"))
+            return _mock_doctors(latitude, longitude, specialty)
+
         results = data.get("results", [])[:5]
 
         doctors = []
@@ -53,6 +68,9 @@ async def find_nearby_doctors(
         if doctors:
             return doctors
         return _mock_doctors(latitude, longitude, specialty)
+    finally:
+        if close_after:
+            await client.aclose()
 
 
 def _mock_doctors(lat: float, lng: float, specialty: str | None = None) -> list[dict]:
