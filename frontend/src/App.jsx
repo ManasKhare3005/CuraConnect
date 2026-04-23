@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   checkBackendHealth,
   checkSttHealth,
+  deleteVital,
   enhanceTranscript,
   fetchConversationHistory,
   fetchVitalsHistory,
@@ -9,10 +10,10 @@ import {
   transcribeAudioBlob,
 } from "./api";
 
-function groupVitalsByDate(vitals) {
+function groupVitalsByDate(vitals, timeZone = null) {
   const groups = {};
   for (const vital of vitals) {
-    const dateKey = vital.recorded_at ? vital.recorded_at.split("T")[0] : "Unknown";
+    const dateKey = normalizeIsoToDateKey(vital.recorded_at, timeZone || undefined);
     if (!groups[dateKey]) groups[dateKey] = [];
     groups[dateKey].push(vital);
   }
@@ -20,15 +21,33 @@ function groupVitalsByDate(vitals) {
 }
 
 function formatDateLabel(dateStr, timeZone = null) {
-  const now = new Date();
-  const today = normalizeIsoToDateKey(now.toISOString(), timeZone || undefined);
-  const yesterday = normalizeIsoToDateKey(
-    new Date(now.getTime() - 86400000).toISOString(),
-    timeZone || undefined
-  );
-  if (dateStr === today) return "Today";
-  if (dateStr === yesterday) return "Yesterday";
-  return dateStr;
+  if (!dateStr || dateStr === "Unknown") {
+    return "Unknown";
+  }
+
+  const keyMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
+  if (keyMatch) {
+    return `${keyMatch[2]}/${keyMatch[3]}/${keyMatch[1]}`;
+  }
+
+  const parsed = new Date(dateStr);
+  if (Number.isNaN(parsed.getTime())) {
+    return dateStr;
+  }
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: timeZone || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(parsed);
+  } catch (_) {
+    return parsed.toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+  }
 }
 
 function normalizeIsoToDateKey(isoValue, timeZone) {
@@ -80,6 +99,7 @@ function formatClockTime(isoValue, timeZone) {
 }
 import AuthPage from "./AuthPage";
 import ProfileCard from "./ProfileCard";
+import VitalsGraph from "./VitalsGraph";
 
 const VITAL_LABELS = {
   blood_pressure: "Blood Pressure",
@@ -91,6 +111,22 @@ const VITAL_LABELS = {
   bmi: "BMI",
   symptom: "Symptom",
   other: "Other",
+};
+
+const NAV_ITEMS = [
+  { key: "profile", label: "Profile", icon: "user" },
+  { key: "vitals", label: "Vitals", icon: "vitals" },
+  { key: "graphs", label: "Graphs", icon: "graph" },
+  { key: "conversations", label: "Conversations", icon: "history" },
+  { key: "doctors", label: "Doctors", icon: "stethoscope" },
+];
+
+const PANEL_TITLES = {
+  profile: "Profile",
+  vitals: "Vitals History",
+  graphs: "Health Graphs",
+  conversations: "Conversations",
+  doctors: "Nearby Doctors",
 };
 
 const MIN_CONFIDENCE_FOR_BACKEND_FALLBACK = 0.58;
@@ -124,15 +160,18 @@ function App() {
   const [micHint, setMicHint] = useState("Connect first to enable voice input.");
   const [canSpeak, setCanSpeak] = useState(true);
   const [canListen, setCanListen] = useState(true);
+  const [autoListenEnabled, setAutoListenEnabled] = useState(true);
   const [isListening, setIsListening] = useState(false);
   const [vitals, setVitals] = useState([]);
   const [conversationHistory, setConversationHistory] = useState([]);
   const [doctors, setDoctors] = useState([]);
+  const [activePanel, setActivePanel] = useState(null);
   const pendingMessageRef = useRef(null);
   const micDeniedRef = useRef(false);
   const recognitionResultHandledRef = useRef(false);
   const lastSubmittedMessageRef = useRef({ normalized: "", timestamp: 0, source: "" });
   const autoListenArmedRef = useRef(false);
+  const autoListenEnabledRef = useRef(true);
   const recognitionStartInFlightRef = useRef(false);
 
   function handleAuth(token, user) {
@@ -152,6 +191,7 @@ function App() {
     setDoctors([]);
     setMessages([]);
     autoListenArmedRef.current = false;
+    setActivePanel(null);
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
         wsRef.current.send(JSON.stringify({ type: "end_session" }));
@@ -239,6 +279,14 @@ function App() {
 
     syncInteractionState();
   }, [canSpeak, canListen]);
+
+  useEffect(() => {
+    autoListenEnabledRef.current = autoListenEnabled;
+    if (!autoListenEnabled) {
+      autoListenArmedRef.current = false;
+    }
+    syncInteractionState();
+  }, [autoListenEnabled]);
 
   function updateStatus(mode, text) {
     setStatus({ mode, text });
@@ -582,20 +630,22 @@ function App() {
         id: String(Date.now()) + Math.random().toString(16).slice(2),
         role,
         text,
+        createdAt: new Date().toISOString(),
       });
     });
   }
 
   function disableInteraction() {
-    setMicEnabled(false);
-    setMicHint("Session ended. Type a message to start a new one.");
+    setMicEnabled(canSpeakRef.current);
+    setMicHint("Session ended. Tap mic or type to start a new one.");
   }
 
   function syncInteractionState() {
     const isConnected = wsRef.current && wsRef.current.readyState === WebSocket.OPEN;
 
     if (!isConnected) {
-      setMicEnabled(false);
+      setMicEnabled(canSpeakRef.current);
+      setMicHint("Tap mic or type to start.");
       return;
     }
 
@@ -613,6 +663,7 @@ function App() {
 
     setMicEnabled(!isSpeakingRef.current);
     const autoListenReady =
+      autoListenEnabledRef.current &&
       autoListenArmedRef.current &&
       !isSpeakingRef.current &&
       !isListeningRef.current &&
@@ -622,7 +673,9 @@ function App() {
         ? "Assistant is speaking..."
         : autoListenReady
           ? "Auto-listen is ready for the next reply."
-          : "Tap the mic button when you want to speak."
+          : autoListenEnabledRef.current
+            ? "Tap the mic button when you want to speak."
+            : "Auto-listen is off. Tap the mic button when ready."
     );
   }
 
@@ -878,6 +931,10 @@ function App() {
   }
 
   function maybeAutoStartListening() {
+    if (!autoListenEnabledRef.current) {
+      return;
+    }
+
     if (!autoListenArmedRef.current) {
       return;
     }
@@ -1113,7 +1170,7 @@ function App() {
 
       // Arm one auto-listen turn after this assistant reply.
       if (!data.session_complete) {
-        autoListenArmedRef.current = true;
+        autoListenArmedRef.current = autoListenEnabledRef.current;
       } else {
         autoListenArmedRef.current = false;
       }
@@ -1145,6 +1202,7 @@ function App() {
 
     if (data.type === "doctors_found") {
       setDoctors(Array.isArray(data.doctors) ? data.doctors : []);
+      setActivePanel("doctors");
       return;
     }
 
@@ -1174,6 +1232,13 @@ function App() {
         fetchVitalsHistory(authToken),
         fetchConversationHistory(authToken, { limitSessions: 30 }),
       ]);
+      const tokenExpired =
+        (vitalsResult.status === "rejected" && vitalsResult.reason?.status === 401) ||
+        (conversationsResult.status === "rejected" && conversationsResult.reason?.status === 401);
+      if (tokenExpired) {
+        handleLogout();
+        return;
+      }
       if (vitalsResult.status === "fulfilled" && Array.isArray(vitalsResult.value)) {
         setVitals(vitalsResult.value);
       }
@@ -1251,11 +1316,17 @@ function App() {
       return;
     }
 
-    if (!recognitionRef.current) {
+    // If disconnected, connect first then start listening once open
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      connectSession().then(function () {
+        if (recognitionRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          void startRecognitionSession("manual");
+        }
+      });
       return;
     }
 
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+    if (!recognitionRef.current) {
       return;
     }
 
@@ -1291,261 +1362,458 @@ function App() {
     return <AuthPage onAuth={handleAuth} />;
   }
 
-  return (
-    <>
-      <div className="bg-noise" aria-hidden="true"></div>
+  const vitalsTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
-      <main className="app-shell">
-        <header className="topbar">
-          <div className="brand">
-            <div className="brand-badge">CC</div>
-            <div>
-              <h1>CuraConnect</h1>
-              <p>Simple health check-ins with voice and text</p>
-            </div>
-          </div>
+  function formatLiveMessageTime(isoValue) {
+    return formatClockTime(isoValue || new Date().toISOString(), vitalsTimezone);
+  }
 
-          <div className="topbar-right">
-            <div className={status.mode ? "status-dot " + status.mode : "status-dot"}>
-              <span className="dot"></span>
-              <span>{status.text}</span>
-            </div>
-            <div className="user-info">
-              <span>{authUser.name}</span>
-              <button type="button" className="btn-logout" onClick={handleLogout}>Logout</button>
-            </div>
-          </div>
-        </header>
+  function togglePanel(panelKey) {
+    setActivePanel(function (prev) {
+      return prev === panelKey ? null : panelKey;
+    });
+  }
 
-        <section className="layout">
-          <section className="chat-card">
-            <div className="card-title-row">
-              <h2>Conversation</h2>
-              <span className="pill">Live</span>
-            </div>
+  function renderRailIcon(iconName) {
+    if (iconName === "user") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 12a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4z"></path>
+          <path d="M4 20a8 8 0 0 1 16 0"></path>
+        </svg>
+      );
+    }
 
-            <div className="mode-row">
-              <label className="mode-toggle">
-                <input
-                  type="checkbox"
-                  checked={canSpeak}
-                  onChange={function (event) {
-                    setCanSpeak(event.target.checked);
-                  }}
-                />
-                <span>I can speak</span>
-              </label>
+    if (iconName === "vitals") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3 12h4l2.2-5.2 4.1 10.6L16 12h5"></path>
+        </svg>
+      );
+    }
 
-              <label className="mode-toggle">
-                <input
-                  type="checkbox"
-                  checked={canListen}
-                  onChange={function (event) {
-                    setCanListen(event.target.checked);
-                  }}
-                />
-                <span>I can listen</span>
-              </label>
+    if (iconName === "history") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3.5 12A8.5 8.5 0 1 0 6 5.8"></path>
+          <path d="M3.2 3.8v4.3h4.3"></path>
+          <path d="M12 7v5l3.3 2"></path>
+        </svg>
+      );
+    }
 
-              <span className="mode-pill">{getModeLabel()}</span>
-            </div>
+    if (iconName === "graph") {
+      return (
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+        </svg>
+      );
+    }
 
-            <div className="transcript">
-              {messages.length === 0 && !typing ? (
-                <p className="empty-state">Type a message or tap the mic to start your health check-in.</p>
-              ) : null}
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M10.2 4.3a2.4 2.4 0 1 1 3.6 0l.5 1a8 8 0 0 1 1.8 1l1-.5a2.4 2.4 0 1 1 2.4 4.2l-1 .6a8 8 0 0 1 0 2.1l1 .6a2.4 2.4 0 1 1-2.4 4.1l-1-.5a8 8 0 0 1-1.8 1l-.5 1a2.4 2.4 0 1 1-3.6 0l-.5-1a8 8 0 0 1-1.8-1l-1 .5a2.4 2.4 0 1 1-2.4-4.1l1-.6a8 8 0 0 1 0-2.1l-1-.6a2.4 2.4 0 1 1 2.4-4.2l1 .5a8 8 0 0 1 1.8-1z"></path>
+        <circle cx="12" cy="12" r="2.8"></circle>
+      </svg>
+    );
+  }
 
-              {messages.map(function (msg) {
-                return (
-                  <div className={"message " + msg.role} key={msg.id}>
-                    <div className="avatar">{msg.role === "agent" ? "AI" : "YOU"}</div>
-                    <div className="bubble">{msg.text}</div>
-                  </div>
-                );
-              })}
+  function renderVitalIcon(vitalType) {
+    const icons = {
+      blood_pressure: <svg viewBox="0 0 24 24"><path d="M3 12h4l2.2-5.2 4.1 10.6L16 12h5"></path></svg>,
+      heart_rate: <svg viewBox="0 0 24 24"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21l7.8-7.8 1-1a5.5 5.5 0 0 0 0-7.8z"></path></svg>,
+      temperature: <svg viewBox="0 0 24 24"><path d="M14 14.8V5a2 2 0 1 0-4 0v9.8a4 4 0 1 0 4 0z"></path></svg>,
+      oxygen_saturation: <svg viewBox="0 0 24 24"><path d="M2 12h4l3-9 4 18 3-9h6"></path></svg>,
+      blood_glucose: <svg viewBox="0 0 24 24"><path d="M12 2.7c-5 5-7.5 8.3-7.5 12a7.5 7.5 0 0 0 15 0c0-3.7-2.5-7-7.5-12z"></path></svg>,
+      weight: <svg viewBox="0 0 24 24"><path d="M6.5 6.5h11l1 11H5.5z"></path><circle cx="12" cy="4.5" r="2.5"></circle></svg>,
+      symptom: <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>,
+    };
+    return <span className={"cc-vital-icon cc-vi-" + vitalType}>{icons[vitalType] || icons.symptom}</span>;
+  }
 
-              {typing ? (
-                <div className="message agent" id="typingIndicator">
-                  <div className="avatar">AI</div>
-                  <div className="bubble">
-                    <div className="typing">
-                      <span></span>
-                      <span></span>
-                      <span></span>
-                    </div>
-                  </div>
-                </div>
-              ) : null}
+  function summarizeConversation(messagesForSession) {
+    if (!Array.isArray(messagesForSession) || messagesForSession.length === 0) {
+      return { title: "Conversation", summary: "No messages available." };
+    }
 
-              <div ref={transcriptBottomRef}></div>
-            </div>
+    const assistantLine =
+      messagesForSession.find(function (entry) {
+        return entry.role === "assistant" && entry.content;
+      }) || messagesForSession[0];
 
-            <form className="text-form" onSubmit={onSubmit} autoComplete="off">
-              <input
-                type="text"
-                value={inputValue}
-                disabled={false}
-                onChange={function (event) {
-                  setInputValue(event.target.value);
-                }}
-                placeholder="Type your update (e.g. My heart rate is 85)"
-              />
-              <button className="send-btn" type="submit" disabled={false} title="Send message">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="22" y1="2" x2="11" y2="13"></line>
-                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-                </svg>
-              </button>
-              <button
-                className={isListening ? "mic-btn listening" : "mic-btn"}
-                type="button"
-                onClick={toggleVoice}
-                disabled={!micEnabled}
-                title={micHint}
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                  <line x1="12" y1="19" x2="12" y2="23"></line>
-                  <line x1="8" y1="23" x2="16" y2="23"></line>
-                </svg>
-              </button>
-            </form>
+    const rawText = (assistantLine && assistantLine.content ? assistantLine.content : "Conversation").trim();
+    const sentence = rawText.split(/[.!?]/)[0] || rawText;
+    const trimmedTitle = sentence.length > 44 ? sentence.slice(0, 44).trim() + "..." : sentence;
+    const summary = rawText.length > 110 ? rawText.slice(0, 110).trim() + "..." : rawText;
 
-            <p className="controls-hint">{micHint}</p>
-          </section>
+    return {
+      title: trimmedTitle || "Conversation",
+      summary: summary || "Conversation summary unavailable.",
+    };
+  }
 
-          <aside className="sidebar">
-            <section className="side-card">
-              <ProfileCard user={authUser} token={authToken} onUpdate={handleProfileUpdate} onDeleteAccount={handleLogout} />
-            </section>
+  async function handleDeleteVital(vitalId) {
+    try {
+      await deleteVital(authToken, vitalId);
+      setVitals(function (prev) { return prev.filter(function (v) { return v.id !== vitalId; }); });
+    } catch (_) {}
+  }
 
-            <section className="side-card">
-              <h3>Vitals History</h3>
-              <div className="vitals-list">
-                {vitals.length === 0 ? (
-                  <p className="empty-state">No vitals yet. Share readings in chat to start tracking.</p>
-                ) : (
-                  groupVitalsByDate(vitals).map(function ([dateKey, dateVitals]) {
+  function groupDoctorsBySpecialty(docs) {
+    var groups = {};
+    docs.forEach(function (doc) {
+      var key = doc.recommended_for || "General";
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(doc);
+    });
+    return Object.entries(groups);
+  }
+
+  function renderDrawerContent() {
+    if (activePanel === "profile") {
+      return (
+        <div className="cc-panel-profile">
+          <ProfileCard
+            user={authUser}
+            token={authToken}
+            onUpdate={handleProfileUpdate}
+            onDeleteAccount={handleLogout}
+          />
+        </div>
+      );
+    }
+
+    if (activePanel === "vitals") {
+      return (
+        <div className="cc-panel-list">
+          {vitals.length === 0 ? (
+            <p className="cc-empty-panel">No vitals yet. Share readings in chat to start tracking.</p>
+          ) : (
+            groupVitalsByDate(vitals, vitalsTimezone).map(function ([dateKey, dateVitals]) {
+              const showTime = dateVitals.length > 1;
+              return (
+                <section className="cc-group" key={dateKey}>
+                  <h3 className="cc-group-title">{formatDateLabel(dateKey, vitalsTimezone)}</h3>
+                  {dateVitals.map(function (vital, index) {
                     return (
-                      <div className="vitals-date-group" key={dateKey}>
-                        <div className="vitals-date-label">{formatDateLabel(dateKey)}</div>
-                        {dateVitals.map(function (vital, index) {
-                          return (
-                            <div className="vital-card" key={(vital.id || "vital") + "-" + index}>
-                              <div className="vital-meta">
-                                <div className="vital-label">
-                                  {VITAL_LABELS[vital.vital_type] || vital.vital_type || "Vital"}
-                                </div>
-                                <div className="vital-value">
-                                  {vital.value}
-                                  {vital.unit ? " " + vital.unit : ""}
-                                </div>
-                              </div>
-                              {vital.notes ? <div className="vital-note">{vital.notes}</div> : null}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </section>
-
-            <section className="side-card">
-              <h3>Conversation History</h3>
-              <div className="conversation-history-list">
-                {conversationHistory.length === 0 ? (
-                  <p className="empty-state">No saved conversations yet.</p>
-                ) : (
-                  conversationHistory.map(function (session, index) {
-                    const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
-                    const timezoneName =
-                      (typeof session.timezone_name === "string" && session.timezone_name.trim()) ||
-                      Intl.DateTimeFormat().resolvedOptions().timeZone ||
-                      "UTC";
-                    const anchorTimestamp = session.started_at || (sessionMessages[0] && sessionMessages[0].created_at) || null;
-                    const dateKey = normalizeIsoToDateKey(anchorTimestamp, timezoneName);
-                    const dateLabel = formatDateLabel(dateKey, timezoneName);
-                    const timeLabel = formatClockTime(anchorTimestamp, timezoneName);
-                    const messageCount = sessionMessages.length || session.message_count || 0;
-                    return (
-                      <details className="conversation-session" key={(session.session_id || "session") + "-" + index}>
-                        <summary className="conversation-session-summary">
-                          <span className="conversation-session-title">{dateLabel} • {timeLabel}</span>
-                          <span className="conversation-session-meta">
-                            {messageCount} message{messageCount === 1 ? "" : "s"} • {timezoneName}
-                          </span>
-                        </summary>
-                        <div className="conversation-session-body">
-                          {sessionMessages.length === 0 ? (
-                            <p className="empty-state">No messages saved in this session.</p>
-                          ) : (
-                            sessionMessages.map(function (message, msgIndex) {
-                              const role = message.role === "assistant" ? "assistant" : "user";
-                              return (
-                                <div className={"conversation-line " + role} key={(message.id || "msg") + "-" + msgIndex}>
-                                  <div className="conversation-line-header">
-                                    <span className="conversation-line-role">{role === "assistant" ? "AI" : "YOU"}</span>
-                                    <span className="conversation-line-time">
-                                      {formatClockTime(message.created_at, timezoneName)}
-                                    </span>
-                                  </div>
-                                  <div className="conversation-line-text">{message.content || ""}</div>
-                                </div>
-                              );
-                            })
+                      <article className="cc-vital-item" key={(vital.id || "vital") + "-" + index}>
+                        <div className="cc-vital-icon-wrap">
+                          {renderVitalIcon(vital.vital_type)}
+                          {vital.id && (
+                            <button
+                              type="button"
+                              className="cc-vital-delete"
+                              title="Delete this reading"
+                              onClick={function () { handleDeleteVital(vital.id); }}
+                            >
+                              <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1.5 14a2 2 0 0 1-2 1.8H8.5a2 2 0 0 1-2-1.8L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path></svg>
+                            </button>
                           )}
                         </div>
-                      </details>
-                    );
-                  })
-                )}
-              </div>
-            </section>
-
-            <section className="side-card">
-              <h3>Nearby Doctors</h3>
-              <div className="doctors-list">
-                {doctors.length === 0 ? (
-                  <p className="empty-state">No recommendations yet.</p>
-                ) : (
-                  doctors.map(function (doc, index) {
-                    return (
-                      <div className="doctor-card" key={(doc.name || "doctor") + "-" + index}>
-                        <div className="doctor-name">{doc.name || "Doctor"}</div>
-                        <div className="doctor-address">{doc.address || "Address unavailable"}</div>
-                        <div className="doctor-meta">
-                          {doc.rating !== undefined && doc.rating !== null ? (
-                            <span className="rating">Rating {doc.rating}</span>
+                        <div className="cc-vital-main">
+                          <div className="cc-vital-name">{VITAL_LABELS[vital.vital_type] || vital.vital_type || "Vital"}</div>
+                          {showTime ? (
+                            <div className="cc-vital-time">{formatClockTime(vital.recorded_at, vitalsTimezone)}</div>
                           ) : null}
+                        </div>
+                        <div className="cc-vital-reading">
+                          <div className="cc-vital-value">{vital.value}</div>
+                          {vital.unit ? <div className="cc-vital-unit">{vital.unit}</div> : null}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </section>
+              );
+            })
+          )}
+        </div>
+      );
+    }
 
-                          {doc.open_now === true ? <span className="open">Open now</span> : null}
-                          {doc.open_now === false ? <span className="closed">Closed</span> : null}
+    if (activePanel === "graphs") {
+      return <VitalsGraph vitals={vitals} />;
+    }
 
+    if (activePanel === "conversations") {
+      return (
+        <div className="cc-panel-list">
+          {conversationHistory.length === 0 ? (
+            <p className="cc-empty-panel">No saved conversations yet.</p>
+          ) : (
+            conversationHistory.map(function (session, index) {
+              const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
+              const timezoneName =
+                (typeof session.timezone_name === "string" && session.timezone_name.trim()) ||
+                Intl.DateTimeFormat().resolvedOptions().timeZone ||
+                "UTC";
+              const anchorTimestamp = session.started_at || (sessionMessages[0] && sessionMessages[0].created_at) || null;
+              const dateKey = normalizeIsoToDateKey(anchorTimestamp, timezoneName);
+              const dateLabel = formatDateLabel(dateKey, timezoneName);
+              const timeLabel = formatClockTime(anchorTimestamp, timezoneName);
+              const messageCount = sessionMessages.length || session.message_count || 0;
+              const preview = summarizeConversation(sessionMessages);
+              return (
+                <article className="cc-session-item" key={(session.session_id || "session") + "-" + index}>
+                  <span className="cc-session-icon">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                  </span>
+                  <div className="cc-session-body">
+                    <div className="cc-session-title">{preview.title}</div>
+                    <div className="cc-session-summary">{preview.summary}</div>
+                    <div className="cc-session-meta">
+                      {dateLabel} &middot; {timeLabel} {timezoneName} &middot; {messageCount} msg{messageCount === 1 ? "" : "s"}
+                    </div>
+                  </div>
+                  <span className="cc-session-chevron">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                  </span>
+                </article>
+              );
+            })
+          )}
+        </div>
+      );
+    }
+
+    if (activePanel === "doctors") {
+      return (
+        <div className="cc-panel-list">
+          {doctors.length === 0 ? (
+            <p className="cc-empty-panel">No recommendations yet.</p>
+          ) : (
+            groupDoctorsBySpecialty(doctors).map(function ([specialty, docs]) {
+              return (
+                <section className="cc-group" key={specialty}>
+                  <h3 className="cc-group-title">{specialty}</h3>
+                  {docs.map(function (doc, index) {
+                    return (
+                      <article className="cc-doctor-item" key={(doc.name || "doctor") + "-" + index}>
+                        <div className="cc-doctor-head">
+                          <div className="cc-doctor-name">{doc.name || "Doctor"}</div>
+                          {doc.rating !== undefined && doc.rating !== null ? (
+                            <span className="cc-doctor-rating">
+                              <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="12 2 15.1 8.3 22 9.3 17 14.1 18.2 21 12 17.8 5.8 21 7 14.1 2 9.3 8.9 8.3 12 2"></polygon></svg>
+                              {doc.rating}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="cc-doctor-address">{doc.address || "Address unavailable"}</div>
+                        {doc.distance_km ? (
+                          <div className="cc-doctor-distance">{doc.distance_km} km away</div>
+                        ) : null}
+                        <div className="cc-doctor-actions">
+                          <button type="button" className="cc-btn-outline" title="Call">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.4 2.1L8 9.9a16 16 0 0 0 6.1 6.1l1.4-1.4a2 2 0 0 1 2.1-.4c.9.3 1.8.5 2.7.7a2 2 0 0 1 1.7 2z"></path></svg>
+                            Call
+                          </button>
                           {doc.maps_url ? (
-                            <a
-                              className="map-link"
-                              href={doc.maps_url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                            >
-                              View map
+                            <a className="cc-btn-outline" href={doc.maps_url} target="_blank" rel="noopener noreferrer">
+                              <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="3 11 22 2 13 21 11 13 3 11"></polygon></svg>
+                              Directions
                             </a>
                           ) : null}
                         </div>
-                      </div>
+                      </article>
                     );
-                  })
-                )}
+                  })}
+                </section>
+              );
+            })
+          )}
+        </div>
+      );
+    }
+
+    return <p className="cc-empty-panel">Choose a panel from the left menu.</p>;
+  }
+
+  return (
+    <div className="cc-shell">
+      <aside className="cc-rail">
+        <div className="cc-rail-logo" aria-label="CuraConnect">C</div>
+        <div className="cc-rail-nav">
+          {NAV_ITEMS.map(function (item) {
+            const isActive = activePanel === item.key;
+            return (
+              <button
+                key={item.key}
+                type="button"
+                className={isActive ? "cc-rail-btn is-active" : "cc-rail-btn"}
+                onClick={function () {
+                  togglePanel(item.key);
+                }}
+                title={item.label}
+                aria-label={item.label}
+              >
+                {renderRailIcon(item.icon)}
+              </button>
+            );
+          })}
+        </div>
+      </aside>
+
+      <main className="cc-main">
+        <header className="cc-topbar">
+          <div className="cc-brand">
+            <h1>CuraConnect</h1>
+            <p>Daily health check-in</p>
+          </div>
+          <div className="cc-top-actions">
+            <span className={status.mode === "connected" ? "cc-status is-connected" : "cc-status"}>
+              {status.text || "Disconnected"}
+            </span>
+            <div className="cc-mode-group" role="group" aria-label="Response mode">
+              <button
+                type="button"
+                className={canListen ? "cc-mode-btn is-active" : "cc-mode-btn"}
+                onClick={function () {
+                  setCanListen(true);
+                }}
+                title="Voice replies"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path><path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path></svg>
+                Voice
+              </button>
+              <button
+                type="button"
+                className={!canListen ? "cc-mode-btn is-active" : "cc-mode-btn"}
+                onClick={function () {
+                  setCanListen(false);
+                }}
+                title="Chat replies"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                Chat
+              </button>
+            </div>
+            <label className="cc-auto-listen" title="Auto-listen after each reply">
+              Auto-listen
+              <input
+                type="checkbox"
+                checked={autoListenEnabled}
+                onChange={function (e) {
+                  setAutoListenEnabled(e.target.checked);
+                  autoListenEnabledRef.current = e.target.checked;
+                }}
+              />
+              <span className="cc-switch-track"><span className="cc-switch-thumb"></span></span>
+            </label>
+          </div>
+        </header>
+
+        {canListen && (
+          <div className="cc-voice-stage">
+            <button
+              type="button"
+              className={isListening ? "cc-voice-orb is-listening" : "cc-voice-orb"}
+              onClick={toggleVoice}
+              disabled={!micEnabled}
+              title={micHint}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path>
+                <path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path>
+                <path d="M12 19.5v2"></path>
+              </svg>
+            </button>
+            <p className="cc-voice-hint">{isListening ? "Listening..." : "Tap to speak"}</p>
+          </div>
+        )}
+
+        <section className="cc-transcript">
+          {messages.length === 0 && !typing ? (
+            <p className="cc-empty-chat">Type a message or tap the mic to start your health check-in.</p>
+          ) : null}
+
+          {messages.map(function (msg) {
+            const isUser = msg.role === "user";
+            return (
+              <div className={isUser ? "cc-msg-row is-user" : "cc-msg-row is-agent"} key={msg.id}>
+                {!isUser ? <div className="cc-msg-avatar">C</div> : null}
+                <div className="cc-msg-bubble">
+                  <div className="cc-msg-text">{msg.text}</div>
+                  <div className="cc-msg-time">{formatLiveMessageTime(msg.createdAt)}</div>
+                </div>
               </div>
-            </section>
-          </aside>
+            );
+          })}
+
+          {typing ? (
+            <div className="cc-msg-row is-agent" id="typingIndicator">
+              <div className="cc-msg-avatar">C</div>
+              <div className="cc-msg-bubble">
+                <div className="typing">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          <div ref={transcriptBottomRef}></div>
         </section>
+
+        <form className="cc-composer" onSubmit={onSubmit} autoComplete="off">
+          <input
+            type="text"
+            value={inputValue}
+            onChange={function (event) {
+              setInputValue(event.target.value);
+            }}
+            placeholder="Type or tap the mic..."
+          />
+          <button className="cc-send-btn" type="submit" title="Send message">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+          <button
+            className={isListening ? "cc-mic-btn is-listening" : "cc-mic-btn"}
+            type="button"
+            onClick={toggleVoice}
+            disabled={!micEnabled}
+            title={micHint}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path>
+              <path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path>
+              <path d="M12 19.5v2"></path>
+            </svg>
+          </button>
+        </form>
       </main>
-    </>
+
+      {activePanel ? (
+        <button
+          type="button"
+          className="cc-drawer-backdrop"
+          aria-label="Close side panel"
+          onClick={function () {
+            setActivePanel(null);
+          }}
+        ></button>
+      ) : null}
+
+      <aside className={activePanel ? "cc-drawer is-open" : "cc-drawer"}>
+        <div className="cc-drawer-header">
+          <h2>{PANEL_TITLES[activePanel] || "Panel"}</h2>
+          <button
+            type="button"
+            className="cc-drawer-close"
+            aria-label="Close panel"
+            onClick={function () {
+              setActivePanel(null);
+            }}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+          </button>
+        </div>
+        <div className="cc-drawer-body">{activePanel ? renderDrawerContent() : null}</div>
+      </aside>
+    </div>
   );
 }
-
 export default App;

@@ -41,7 +41,9 @@ class ConversationSession:
         self.prompted_missing_fields: set[str] = set()
         self.authenticated: bool = False
         self.session_complete: bool = False
+        self.awaiting_more_help_confirmation: bool = False
         self.conversation_tone: str = "neutral"
+        self.vitals_on_cooldown: bool = False
         self.timezone_name: str | None = None
         self.utc_offset_minutes: int | None = None
 
@@ -229,6 +231,7 @@ class ConversationSession:
         # If this is the first message and it's just a conversational closer, reply briefly
         if len(self.messages) <= 1 and self._is_conversational_closer(user_text):
             self.session_complete = True
+            self.awaiting_more_help_confirmation = False
             name = self.profile.get("name") or ""
             if name:
                 return self._pick(
@@ -249,6 +252,7 @@ class ConversationSession:
             )
             if self.session_complete or has_session_context:
                 self.session_complete = True
+                self.awaiting_more_help_confirmation = False
                 name = self.profile.get("name")
                 if name:
                     return self._pick(
@@ -269,8 +273,36 @@ class ConversationSession:
         heart_rate_mentioned = bool(entities.get("heart_rate_mentioned"))
 
         # "nope"/"no"/"skip" with no data — mark last prompted vital as done and move on
-        has_any_data = (entities.get("blood_pressure") or entities.get("heart_rate") is not None
-                        or entities.get("symptoms") or entities.get("name") or entities.get("age") is not None)
+        has_any_data = (
+            entities.get("blood_pressure")
+            or entities.get("heart_rate") is not None
+            or entities.get("symptoms")
+            or entities.get("name")
+            or entities.get("age") is not None
+        )
+
+        # After the soft-close prompt ("anything else?"), let the user either continue or end.
+        if self.awaiting_more_help_confirmation:
+            if self._is_gratitude_or_goodbye(user_text) or stop_requested or entities.get("negative") or skip_response:
+                self.awaiting_more_help_confirmation = False
+                self.session_complete = True
+                return self._final_signoff_message()
+
+            if entities.get("affirmative") and not has_any_data:
+                self.awaiting_more_help_confirmation = False
+                return self._pick(
+                    "Absolutely. What else can I help you with?",
+                    "Of course. Tell me what you would like to update next.",
+                )
+
+            if (
+                has_any_data
+                or entities.get("doctor_request")
+                or entities.get("doctor_decline")
+                or entities.get("no_symptoms")
+            ):
+                self.awaiting_more_help_confirmation = False
+
         if skip_response and not has_any_data:
             vital_prompts = ("blood_pressure", "heart_rate", "temperature", "oxygen_saturation")
             for vp in vital_prompts:
@@ -398,7 +430,9 @@ class ConversationSession:
             stop_requested = False
 
         if stop_requested and not has_structured_data and not clarifications:
-            return "No problem. You are all set for now. If anything changes, I am here to help."
+            self.awaiting_more_help_confirmation = False
+            self.session_complete = True
+            return self._final_signoff_message()
 
         doctors_requested = bool(entities.get("doctor_request")) or (
             self.wants_doctor_suggestions is True and not self.doctors_shared
@@ -456,7 +490,8 @@ class ConversationSession:
             response_parts.append("Please share your full address so I can find nearby doctors for you.")
 
         if stop_requested:
-            response_parts.append("No problem. You are all set for now. If anything changes, I am here to help.")
+            self.awaiting_more_help_confirmation = False
+            response_parts.append(self._final_signoff_message())
             self.session_complete = True
             merged = " ".join(part.strip() for part in response_parts if part and part.strip())
             return merged
@@ -483,6 +518,18 @@ class ConversationSession:
     @staticmethod
     def _pick(*options: str) -> str:
         return random.choice(options)
+
+    def _final_signoff_message(self) -> str:
+        name = self.profile.get("name")
+        if name:
+            return self._pick(
+                f"No problem, {name}. You are all set for now. If anything changes, I am here to help.",
+                f"All set, {name}. I am here whenever you need another check-in.",
+            )
+        return self._pick(
+            "No problem. You are all set for now. If anything changes, I am here to help.",
+            "All set for now. I am here whenever you need another check-in.",
+        )
 
     def _build_acknowledgements(self, updates: dict[str, Any]) -> list[str]:
         parts: list[str] = []
@@ -575,6 +622,14 @@ class ConversationSession:
             # User didn't report symptoms after being asked — treat as no symptoms
             self.symptom_status = "none"
 
+        # Skip vital questions if recently logged
+        if self.vitals_on_cooldown and not self.symptoms:
+            self.awaiting_more_help_confirmation = True
+            return self._pick(
+                "You are all caught up. Is there anything else I can help with?",
+                "Vitals look up to date. Anything else you need?",
+            )
+
         # Symptom-aware vital questions
         has_fever = "fever" in self.symptoms
         has_breathing = "breathlessness" in self.symptoms
@@ -619,11 +674,11 @@ class ConversationSession:
                     "Anything else? I can also note your temperature if you have it.",
                 )
 
-        self.session_complete = True
+        self.awaiting_more_help_confirmation = True
         return self._pick(
-            "That covers everything for now. I am here if anything comes up!",
-            "All set! Let me know any time you want to check in again.",
-            "Looks like we are all caught up. Reach out whenever you need.",
+            "That covers everything for now. Is there anything else I can help you with?",
+            "We are all caught up. Is there anything else you would like to add?",
+            "You are all set for now. Is there anything else I can help you with today?",
         )
 
     def _recommended_specialties(self) -> list[str]:
@@ -714,8 +769,110 @@ class ConversationSession:
             return "moderate"
         return "mild"
 
+    _SYMPTOM_TIPS: dict[str, list[str]] = {
+        "cold": [
+            "Stay hydrated, rest well, and warm fluids like soup or tea can help.",
+            "Plenty of fluids and rest should help. Honey in warm water can soothe things.",
+            "Steam inhalation before bed can ease congestion. Try adding a drop of eucalyptus oil.",
+            "Vitamin C-rich foods like oranges or bell peppers may help your body fight it off faster.",
+            "A warm bowl of chicken soup is actually backed by science for helping with colds.",
+            "Try to get extra sleep tonight. Your immune system does most of its work while you rest.",
+        ],
+        "cough": [
+            "Honey in warm water or herbal tea can soothe a cough naturally.",
+            "Try sleeping with your head slightly elevated to reduce nighttime coughing.",
+            "Stay away from cold drinks for now. Warm liquids will help more.",
+            "A spoonful of honey before bed can reduce cough frequency overnight.",
+            "Keeping the air moist with a humidifier can help ease a dry cough.",
+        ],
+        "fever": [
+            "Paracetamol (acetaminophen) can help bring down a mild fever. Stay hydrated.",
+            "Light clothing and cool compresses on the forehead can provide relief.",
+            "Drink more water than usual. Fever causes your body to lose fluids faster.",
+            "Rest is key. Avoid strenuous activity until the fever breaks.",
+            "A lukewarm bath can help lower body temperature naturally.",
+            "Avoid bundling up in heavy blankets even if you feel cold. Let your body regulate.",
+        ],
+        "allergies": [
+            "An OTC antihistamine like cetirizine or loratadine should help.",
+            "Try to identify and avoid your triggers. Keep windows closed during high pollen days.",
+            "Washing your face and hands after being outside can reduce allergen exposure.",
+            "Nasal saline rinses can flush out irritants and provide quick relief.",
+            "If you have been outside, changing clothes when you get home can reduce lingering allergens.",
+            "Local honey is sometimes said to help build tolerance to local pollen over time.",
+        ],
+        "hives": [
+            "A cool compress can soothe hives. Avoid hot showers for now.",
+            "An antihistamine like cetirizine can help reduce the itching and swelling.",
+            "Wear loose, soft clothing to avoid irritating the affected areas.",
+        ],
+        "rash": [
+            "Keep the area clean and dry. A mild hydrocortisone cream may help with itching.",
+            "Avoid scratching even if it itches. Try a cool compress instead.",
+            "Fragrance-free moisturizer can help if the rash is from dry skin.",
+        ],
+        "itching": [
+            "Calamine lotion or a cool compress can provide relief.",
+            "An OTC antihistamine can help reduce itching from the inside out.",
+            "Avoid hot water on itchy areas. Cool or lukewarm water is better.",
+        ],
+        "sneezing": [
+            "An antihistamine can help if the sneezing is allergy-related.",
+            "Keep tissues handy and try a saline nasal spray for relief.",
+            "Peppermint tea can sometimes help open up nasal passages.",
+        ],
+        "headache": [
+            "Paracetamol or ibuprofen can help. Make sure you are drinking enough water.",
+            "Rest in a quiet, dark room if possible. Screen time can make headaches worse.",
+            "Gentle pressure on your temples or the base of your skull can provide some relief.",
+            "Dehydration is one of the most common headache causes. Try drinking a full glass of water.",
+            "Caffeine in small amounts can sometimes help a headache, but too much can make it worse.",
+            "A cold pack on your forehead for 15 minutes can numb the pain.",
+        ],
+        "sore throat": [
+            "Warm salt water gargles and lozenges can help. Stay hydrated.",
+            "Gargling with warm salt water 3-4 times a day is one of the most effective remedies.",
+            "Cold foods like ice pops can actually numb a sore throat and reduce inflammation.",
+            "Avoid whispering. It actually strains your throat more than talking normally.",
+            "Marshmallow root tea has been used for centuries to soothe sore throats.",
+        ],
+        "nausea": [
+            "Small sips of water or an ORS solution can help. Avoid heavy or spicy food.",
+            "Ginger tea or ginger chews are a natural way to ease nausea.",
+            "Try eating plain crackers or dry toast in small amounts.",
+            "Fresh air and deep, slow breaths can help calm nausea.",
+            "Peppermint tea or even just the scent of peppermint can help settle your stomach.",
+        ],
+        "diarrhea": [
+            "Keep up your fluids. Bland foods like toast, rice, or bananas are easier on the stomach.",
+            "An ORS solution is important to replace lost electrolytes.",
+            "Avoid dairy, caffeine, and greasy foods until things settle.",
+            "Probiotics like yogurt (once you can tolerate it) can help restore gut balance.",
+        ],
+        "body ache": [
+            "Rest and paracetamol or ibuprofen should help with body aches.",
+            "A warm bath or heating pad on sore areas can provide relief.",
+            "Gentle stretching can help if the aches are muscular.",
+            "Make sure you are staying hydrated. Dehydration can make aches worse.",
+            "Magnesium-rich foods like bananas or dark chocolate may help with muscle soreness.",
+        ],
+        "dizziness": [
+            "Sit or lie down until it passes. Stay hydrated and avoid sudden movements.",
+            "If the dizziness is frequent, a doctor visit would be wise.",
+            "Low blood sugar can cause dizziness. Try eating something small.",
+            "Stand up slowly, especially after sitting or lying down for a while.",
+        ],
+        "fatigue": [
+            "Good sleep, hydration, and balanced meals can make a big difference.",
+            "Make sure you are getting enough rest. Your body may need recovery time.",
+            "Even a short 15-minute walk can boost your energy when you are feeling tired.",
+            "Check your iron intake. Low iron is a common cause of fatigue.",
+            "Reducing screen time before bed can improve your sleep quality significantly.",
+            "Try to keep a consistent sleep schedule, even on weekends.",
+        ],
+    }
+
     def _suggest_remedies(self, severity: str) -> str | None:
-        """Return OTC suggestions for mild cases, or an escalation for moderate/serious."""
         if severity == "serious":
             return self._pick(
                 "This looks serious. Please call 911 or your local emergency number if you feel it is getting worse. Do not wait.",
@@ -729,62 +886,22 @@ class ConversationSession:
                 "This looks like it could go either way. Rest up, and if it gets worse or does not improve soon, please consult a doctor.",
             )
 
-        # Mild — suggest OTC remedies based on symptoms
+        # ~40% chance of showing tips for mild cases — avoids being repetitive
+        if random.random() > 0.4:
+            return None
+
         tips: list[str] = []
-
-        if "cold" in self.symptoms or "cough" in self.symptoms:
-            tips.append(self._pick(
-                "For the cold, stay hydrated, rest well, and warm fluids like soup or tea can help.",
-                "Plenty of fluids and rest should help with the cold. Honey in warm water can soothe a cough.",
-            ))
-
-        if "fever" in self.symptoms:
-            tips.append(self._pick(
-                "For a mild fever, paracetamol (acetaminophen) can help. Stay hydrated and rest.",
-                "You can take paracetamol for the fever. Light clothing and cool compresses also help.",
-            ))
-
-        if self.symptoms & {"allergies", "hives", "rash", "itching", "sneezing"}:
-            tips.append(self._pick(
-                "An over-the-counter antihistamine like cetirizine or loratadine should help with the allergy symptoms.",
-                "For allergies, try an OTC antihistamine. Avoid known triggers and keep windows closed if it is pollen-related.",
-            ))
-
-        if "headache" in self.symptoms:
-            tips.append(self._pick(
-                "For a headache, paracetamol or ibuprofen can help. Make sure you are drinking enough water.",
-                "Try paracetamol or ibuprofen for the headache. Rest in a quiet, dark room if possible.",
-            ))
-
-        if "sore throat" in self.symptoms:
-            tips.append(self._pick(
-                "For the sore throat, warm salt water gargles and lozenges can help. Stay hydrated.",
-                "Try gargling with warm salt water. Throat lozenges and warm drinks can ease the pain.",
-            ))
-
-        if "nausea" in self.symptoms or "diarrhea" in self.symptoms:
-            tips.append(self._pick(
-                "Stay hydrated with small sips of water or an ORS solution. Avoid heavy or spicy food for now.",
-                "Keep up your fluids. Bland foods like toast or rice are easier on the stomach.",
-            ))
-
-        if "body ache" in self.symptoms:
-            tips.append(self._pick(
-                "For body aches, rest and paracetamol or ibuprofen should help.",
-                "Body aches usually ease with rest. Paracetamol can take the edge off.",
-            ))
-
-        if "dizziness" in self.symptoms:
-            tips.append(self._pick(
-                "For dizziness, sit or lie down until it passes. Stay hydrated and avoid sudden movements.",
-                "Take it easy and drink water. If the dizziness is frequent, a doctor visit would be wise.",
-            ))
-
-        if "fatigue" in self.symptoms:
-            tips.append(self._pick(
-                "Fatigue often improves with good sleep, hydration, and balanced meals.",
-                "Make sure you are getting enough rest and eating well. Fatigue can be a sign your body needs recovery time.",
-            ))
+        for symptom in self.symptoms:
+            pool = self._SYMPTOM_TIPS.get(symptom)
+            if not pool:
+                # Check alias groups
+                if symptom in ("hives", "rash", "itching", "sneezing"):
+                    pool = self._SYMPTOM_TIPS.get(symptom) or self._SYMPTOM_TIPS.get("allergies")
+                if not pool:
+                    continue
+            tips.append(self._pick(*pool))
+            if len(tips) >= 2:
+                break
 
         if not tips:
             return None
@@ -792,8 +909,10 @@ class ConversationSession:
         advice = " ".join(tips)
         disclaimer = self._pick(
             "Of course, if things get worse, please see a doctor.",
-            "These are general suggestions. If your condition worsens, do consult a doctor.",
-            "Keep an eye on how you feel. If it does not improve in a couple of days, please visit a doctor.",
+            "These are just general tips. Consult a doctor if it persists.",
+            "Keep an eye on how you feel over the next day or two.",
+            "Just some pointers. You know your body best.",
+            "Hope that helps. Let me know if you need anything else.",
         )
         return f"{advice} {disclaimer}"
 
@@ -1544,8 +1663,13 @@ class ConversationSession:
             "specialties": [s for s in specialties if s],
         }
 
-    def identify_user(self, name: str, age: int | None = None, from_auth: bool = False):
-        user = database.get_or_create_user(name, age)
+    def identify_user(self, name: str, age: int | None = None, from_auth: bool = False, user_id: int | None = None):
+        if user_id is not None:
+            user = database.get_user_by_id(user_id)
+            if user is None:
+                return
+        else:
+            user = database.get_or_create_user(name, age)
         self.user_id = user.id
         self.user_name = user.name
         self.profile["name"] = user.name
@@ -1553,8 +1677,22 @@ class ConversationSession:
             self.profile["age"] = age
         if from_auth:
             self.authenticated = True
+            self._check_vitals_cooldown()
         database.update_session_user(self.session_id, self.user_id)
         database.attach_session_messages_to_user(self.session_id, self.user_id)
+
+    def _check_vitals_cooldown(self):
+        COOLDOWN_HOURS = 6
+        if self.user_id is None:
+            return
+        last_ts = database.get_latest_vital_timestamp(self.user_id)
+        if last_ts is None:
+            return
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=timezone.utc)
+        elapsed = datetime.now(timezone.utc) - last_ts
+        if elapsed < timedelta(hours=COOLDOWN_HOURS):
+            self.vitals_on_cooldown = True
 
     def end_session(self):
         database.close_session(self.session_id)

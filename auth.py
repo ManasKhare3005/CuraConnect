@@ -9,7 +9,7 @@ load_dotenv()
 
 JWT_SECRET = os.getenv("JWT_SECRET", "curaconnect-dev-secret")
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRY_HOURS = 24
+JWT_EXPIRY_HOURS = 24 * 30  # 30 days
 
 
 def hash_password(plain: str) -> str:

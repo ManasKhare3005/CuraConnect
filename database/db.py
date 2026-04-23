@@ -338,6 +338,27 @@ def get_vitals_history(user_id: int, limit: int = 50) -> list[dict]:
         ]
 
 
+def delete_vital(user_id: int, vital_id: int) -> bool:
+    with SessionLocal() as db:
+        vital = db.query(Vital).filter(Vital.id == vital_id, Vital.user_id == user_id).first()
+        if not vital:
+            return False
+        db.delete(vital)
+        db.commit()
+        return True
+
+
+def get_latest_vital_timestamp(user_id: int) -> datetime | None:
+    with SessionLocal() as db:
+        vital = (
+            db.query(Vital)
+            .filter(Vital.user_id == user_id, Vital.vital_type != "symptom")
+            .order_by(Vital.recorded_at.desc())
+            .first()
+        )
+        return vital.recorded_at if vital else None
+
+
 def get_conversation_history(
     user_id: int,
     limit_sessions: int = 25,

@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -122,6 +122,22 @@ def _parse_csv_list(raw: str | None) -> list[str]:
     return [token.strip() for token in raw.split(",") if token.strip()]
 
 
+def _parse_user_date(raw_value: str) -> date:
+    """Accept MM/DD/YYYY and ISO YYYY-MM-DD date inputs."""
+    candidate = raw_value.strip()
+    if not candidate:
+        raise ValueError("empty date value")
+
+    # Preferred UI format first.
+    try:
+        return datetime.strptime(candidate, "%m/%d/%Y").date()
+    except ValueError:
+        pass
+
+    # Keep backward compatibility with existing HTML date input payloads.
+    return date.fromisoformat(candidate)
+
+
 @app.post("/api/auth/register", response_model=AuthResponse)
 async def register(payload: RegisterRequest):
     email = payload.email.strip().lower()
@@ -135,9 +151,9 @@ async def register(payload: RegisterRequest):
     parsed_dob: date | None = None
     if payload.dob:
         try:
-            parsed_dob = date.fromisoformat(payload.dob)
+            parsed_dob = _parse_user_date(payload.dob)
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid date of birth. Use YYYY-MM-DD format.")
+            raise HTTPException(status_code=400, detail="Invalid date of birth. Use MM/DD/YYYY.")
         if parsed_dob >= date.today():
             raise HTTPException(status_code=400, detail="Date of birth must be in the past.")
 
@@ -214,9 +230,9 @@ async def update_profile(payload: ProfileUpdateRequest, token: str):
             parsed_dob = None
         else:
             try:
-                parsed_dob = date.fromisoformat(payload.dob)
+                parsed_dob = _parse_user_date(payload.dob)
             except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid date. Use YYYY-MM-DD.")
+                raise HTTPException(status_code=400, detail="Invalid date. Use MM/DD/YYYY.")
             if parsed_dob >= date.today():
                 raise HTTPException(status_code=400, detail="Date of birth must be in the past.")
 
@@ -241,6 +257,17 @@ async def vitals_history(token: str):
     if not decoded:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
     return database.get_vitals_history(decoded["sub"])
+
+
+@app.delete("/api/vitals/{vital_id}")
+async def delete_vital(vital_id: int, token: str):
+    decoded = decode_access_token(token)
+    if not decoded:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    deleted = database.delete_vital(decoded["sub"], vital_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Vital not found.")
+    return {"ok": True}
 
 
 @app.get("/api/conversations/history")
@@ -365,7 +392,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = None):
             user = database.get_user_by_id(payload["sub"])
             if user:
                 age = database.age_from_dob(user.dob) if user.dob else user.age
-                session.identify_user(user.name, age, from_auth=True)
+                session.identify_user(user.name, age, from_auth=True, user_id=user.id)
 
     try:
         while True:

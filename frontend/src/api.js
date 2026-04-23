@@ -59,7 +59,9 @@ async function request(baseUrl, path, init = {}) {
     } catch (error) {
       // Keep default message.
     }
-    throw new Error(message);
+    const err = new Error(message);
+    err.status = response.status;
+    throw err;
   }
 
   return response.json();
@@ -126,6 +128,12 @@ export function fetchConversationHistory(token, options = {}) {
     API_BASE,
     `/api/conversations/history?token=${encodeURIComponent(token)}&limit_sessions=${encodeURIComponent(limitSessions)}`
   );
+}
+
+export function deleteVital(token, vitalId) {
+  return request(API_BASE, `/api/vitals/${vitalId}?token=${encodeURIComponent(token)}`, {
+    method: "DELETE",
+  });
 }
 
 export function deleteAccount(token) {
