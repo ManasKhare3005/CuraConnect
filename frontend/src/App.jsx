@@ -5,6 +5,10 @@ import {
   deleteVital,
   enhanceTranscript,
   fetchConversationHistory,
+  fetchMedication,
+  fetchMedications,
+  fetchRefills,
+  fetchSideEffectTimeline,
   fetchVitalsHistory,
   resolveWebSocketUrl,
   transcribeAudioBlob,
@@ -98,7 +102,10 @@ function formatClockTime(isoValue, timeZone) {
   }
 }
 import AuthPage from "./AuthPage";
+import ClinicDashboard from "./ClinicDashboard";
+import MedicationCard from "./MedicationCard";
 import ProfileCard from "./ProfileCard";
+import SideEffectTimeline from "./SideEffectTimeline";
 import VitalsGraph from "./VitalsGraph";
 
 const VITAL_LABELS = {
@@ -128,6 +135,12 @@ const PANEL_TITLES = {
   conversations: "Conversations",
   doctors: "Nearby Doctors",
 };
+
+const PRIMARY_VIEWS = [
+  { key: "chat", label: "Chat" },
+  { key: "dashboard", label: "Dashboard" },
+  { key: "health", label: "My Health" },
+];
 
 const MIN_CONFIDENCE_FOR_BACKEND_FALLBACK = 0.58;
 const MIN_AUDIO_BYTES_FOR_BACKEND_TRANSCRIBE = 1500;
@@ -165,7 +178,14 @@ function App() {
   const [vitals, setVitals] = useState([]);
   const [conversationHistory, setConversationHistory] = useState([]);
   const [doctors, setDoctors] = useState([]);
+  const [activeView, setActiveView] = useState("chat");
   const [activePanel, setActivePanel] = useState(null);
+  const [selectedConversationSession, setSelectedConversationSession] = useState(null);
+  const [activeMedication, setActiveMedication] = useState(null);
+  const [activeRefills, setActiveRefills] = useState([]);
+  const [sideEffectTimeline, setSideEffectTimeline] = useState([]);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [healthError, setHealthError] = useState("");
   const pendingMessageRef = useRef(null);
   const micDeniedRef = useRef(false);
   const recognitionResultHandledRef = useRef(false);
@@ -189,6 +209,13 @@ function App() {
     setConversationHistory([]);
     setVitals([]);
     setDoctors([]);
+    setActiveMedication(null);
+    setActiveRefills([]);
+    setSideEffectTimeline([]);
+    setHealthLoading(false);
+    setHealthError("");
+    setActiveView("chat");
+    setSelectedConversationSession(null);
     setMessages([]);
     autoListenArmedRef.current = false;
     setActivePanel(null);
@@ -261,6 +288,38 @@ function App() {
       connectSession();
     }
   }, [authToken]);
+
+  useEffect(() => {
+    if (authToken) {
+      void refreshHealthData(authToken, { silent: true });
+    }
+  }, [authToken]);
+
+  useEffect(() => {
+    if (activeView !== "chat") {
+      setActivePanel(null);
+    }
+  }, [activeView]);
+
+  useEffect(
+    function bindConversationModalEscape() {
+      if (!selectedConversationSession) {
+        return undefined;
+      }
+
+      function onKeyDown(event) {
+        if (event.key === "Escape") {
+          setSelectedConversationSession(null);
+        }
+      }
+
+      window.addEventListener("keydown", onKeyDown);
+      return function cleanup() {
+        window.removeEventListener("keydown", onKeyDown);
+      };
+    },
+    [selectedConversationSession]
+  );
 
   useEffect(() => {
     canSpeakRef.current = canSpeak;
@@ -729,6 +788,69 @@ function App() {
     } catch (_) {
       // keep previous history on transient failures
     }
+  }
+
+  async function refreshHealthData(tokenOverride = null, options = {}) {
+    const activeToken = tokenOverride || authToken;
+    if (!activeToken) {
+      return;
+    }
+
+    if (!options.silent) {
+      setHealthLoading(true);
+    }
+    setHealthError("");
+
+    const [medicationsResult, sideEffectsResult, refillsResult] = await Promise.allSettled([
+      fetchMedications(activeToken),
+      fetchSideEffectTimeline(activeToken),
+      fetchRefills(activeToken),
+    ]);
+
+    const tokenExpired =
+      (medicationsResult.status === "rejected" && medicationsResult.reason?.status === 401) ||
+      (sideEffectsResult.status === "rejected" && sideEffectsResult.reason?.status === 401) ||
+      (refillsResult.status === "rejected" && refillsResult.reason?.status === 401);
+
+    if (tokenExpired) {
+      handleLogout();
+      return;
+    }
+
+    let nextMedication = null;
+    let nextError = "";
+
+    if (medicationsResult.status === "fulfilled" && Array.isArray(medicationsResult.value) && medicationsResult.value.length > 0) {
+      const summaryMedication = medicationsResult.value[0];
+      try {
+        nextMedication = await fetchMedication(activeToken, summaryMedication.id);
+      } catch (err) {
+        if (err && err.status === 401) {
+          handleLogout();
+          return;
+        }
+        nextMedication = summaryMedication;
+        nextError = err?.message || "";
+      }
+    }
+
+    if (sideEffectsResult.status === "fulfilled" && Array.isArray(sideEffectsResult.value)) {
+      setSideEffectTimeline(sideEffectsResult.value);
+    } else if (!nextError) {
+      nextError = sideEffectsResult.reason?.message || "";
+    }
+
+    if (refillsResult.status === "fulfilled" && Array.isArray(refillsResult.value)) {
+      setActiveRefills(refillsResult.value);
+    } else if (!nextError) {
+      nextError = refillsResult.reason?.message || "";
+    }
+
+    setActiveMedication(nextMedication);
+    if (nextError) {
+      setHealthError(nextError);
+    }
+    setHealthLoading(false);
   }
 
   function sendUserMessage(text) {
@@ -1200,9 +1322,27 @@ function App() {
       return;
     }
 
+    if (
+      data.type === "medication_event_logged" ||
+      data.type === "side_effect_logged" ||
+      data.type === "refill_flagged" ||
+      data.type === "escalation_created"
+    ) {
+      void refreshHealthData(null, { silent: true });
+      return;
+    }
+
     if (data.type === "doctors_found") {
       setDoctors(Array.isArray(data.doctors) ? data.doctors : []);
       setActivePanel("doctors");
+      return;
+    }
+
+    if (data.type === "session_timeout") {
+      awaitingAgentReplyRef.current = false;
+      setTyping(false);
+      autoListenArmedRef.current = false;
+      syncInteractionState();
       return;
     }
 
@@ -1469,6 +1609,255 @@ function App() {
     return Object.entries(groups);
   }
 
+  function openConversationSession(session) {
+    setSelectedConversationSession(session);
+  }
+
+  function closeConversationSession() {
+    setSelectedConversationSession(null);
+  }
+
+  function handleSessionCardKeyDown(event, session) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openConversationSession(session);
+    }
+  }
+
+  function renderViewSubtitle() {
+    if (activeView === "dashboard") {
+      return "Clinician operations";
+    }
+    if (activeView === "health") {
+      return "Medication, vitals, and adherence";
+    }
+    return "Daily health check-in";
+  }
+
+  function renderHealthView() {
+    const recentSessions = conversationHistory.slice(0, 4);
+    const timelineItems =
+      Array.isArray(sideEffectTimeline) && sideEffectTimeline.length > 0
+        ? sideEffectTimeline
+        : (activeMedication && Array.isArray(activeMedication.side_effects) ? activeMedication.side_effects : []);
+
+    return (
+      <div className="cc-view-stage">
+        <div className="cc-section-head">
+          <h2>My Health</h2>
+          <p>Review your GLP-1 treatment, refill workflow, and recent health trends.</p>
+        </div>
+
+        {healthError ? <div className="cc-inline-error">{healthError}</div> : null}
+
+        <div className="cc-health-grid">
+          <div className="cc-health-stack">
+            <MedicationCard
+              token={authToken}
+              medication={activeMedication}
+              refills={activeRefills}
+              onRefresh={refreshHealthData}
+            />
+
+            <section className="cc-card-shell">
+              <ProfileCard
+                user={authUser}
+                token={authToken}
+                onUpdate={handleProfileUpdate}
+                onDeleteAccount={handleLogout}
+              />
+            </section>
+          </div>
+
+          <div className="cc-health-stack cc-health-stack-wide">
+            <section className="cc-card-shell">
+              <div className="cc-section-head cc-section-head-tight">
+                <h3>Vitals Trends</h3>
+                <p>{healthLoading ? "Refreshing health data..." : "Recent readings saved from chat and structured tracking."}</p>
+              </div>
+              <VitalsGraph vitals={vitals} />
+            </section>
+          </div>
+        </div>
+
+        <SideEffectTimeline medication={activeMedication} sideEffects={timelineItems} />
+
+        <div className="cc-health-secondary-grid">
+          <section className="cc-card-shell">
+            <div className="cc-section-head cc-section-head-tight">
+              <h3>Refill Status</h3>
+              <p>Track active refill requests for your current medication.</p>
+            </div>
+
+            {activeRefills.length === 0 ? (
+              <div className="cc-empty-state">
+                <p>No active refill requests right now.</p>
+              </div>
+            ) : (
+              <div className="cc-panel-list">
+                {activeRefills.map(function (refill) {
+                  const medicationName =
+                    (refill.medication && (refill.medication.brand_name || refill.medication.drug_name)) ||
+                    "Medication";
+                  return (
+                    <article className="cc-refill-item" key={refill.id}>
+                      <div className="cc-refill-item-head">
+                        <strong>{medicationName}</strong>
+                        <span className="cc-refill-status">{String(refill.status || "due").replace(/_/g, " ")}</span>
+                      </div>
+                      <span>{refill.pharmacy_name || "Care team coordination in progress"}</span>
+                      <span>{refill.due_date ? `Due ${formatDateLabel(refill.due_date)}` : "Due date pending"}</span>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          <section className="cc-card-shell">
+            <div className="cc-section-head cc-section-head-tight">
+              <h3>Recent Sessions</h3>
+              <p>Catch up on the last conversations saved from the chat experience.</p>
+            </div>
+
+            {recentSessions.length === 0 ? (
+              <div className="cc-empty-state">
+                <p>No saved sessions yet.</p>
+              </div>
+            ) : (
+              <div className="cc-panel-list">
+                {recentSessions.map(function (session, index) {
+                  const sessionMessages = Array.isArray(session.messages) ? session.messages : [];
+                  const preview = summarizeConversation(sessionMessages);
+                  const anchorTimestamp =
+                    session.started_at || (sessionMessages[0] && sessionMessages[0].created_at) || null;
+                  const timezoneName =
+                    (typeof session.timezone_name === "string" && session.timezone_name.trim()) ||
+                    Intl.DateTimeFormat().resolvedOptions().timeZone ||
+                    "UTC";
+                  return (
+                    <article
+                      className="cc-session-item"
+                      key={(session.session_id || "health-session") + "-" + index}
+                      role="button"
+                      tabIndex={0}
+                      onClick={function () {
+                        openConversationSession(session);
+                      }}
+                      onKeyDown={function (event) {
+                        handleSessionCardKeyDown(event, session);
+                      }}
+                      aria-label={`Open conversation from ${formatDateLabel(normalizeIsoToDateKey(anchorTimestamp, timezoneName), timezoneName)}`}
+                    >
+                      <div className="cc-session-body">
+                        <div className="cc-session-title">{preview.title}</div>
+                        <div className="cc-session-summary">{preview.summary}</div>
+                        <div className="cc-session-meta">
+                          {formatDateLabel(normalizeIsoToDateKey(anchorTimestamp, timezoneName), timezoneName)}
+                          {" \u00b7 "}
+                          {formatClockTime(anchorTimestamp, timezoneName)}
+                        </div>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        </div>
+      </div>
+    );
+  }
+
+  function renderConversationHistoryModal() {
+    if (!selectedConversationSession) {
+      return null;
+    }
+
+    const sessionMessages = Array.isArray(selectedConversationSession.messages)
+      ? selectedConversationSession.messages
+      : [];
+    const timezoneName =
+      (typeof selectedConversationSession.timezone_name === "string" && selectedConversationSession.timezone_name.trim()) ||
+      Intl.DateTimeFormat().resolvedOptions().timeZone ||
+      "UTC";
+    const anchorTimestamp =
+      selectedConversationSession.started_at ||
+      (sessionMessages[0] && sessionMessages[0].created_at) ||
+      null;
+    const preview = summarizeConversation(sessionMessages);
+    const dateKey = normalizeIsoToDateKey(anchorTimestamp, timezoneName);
+    const messageCount = sessionMessages.length || selectedConversationSession.message_count || 0;
+
+    return (
+      <div
+        className="cc-history-modal-backdrop"
+        onClick={function () {
+          closeConversationSession();
+        }}
+      >
+        <div
+          className="cc-history-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Past conversation transcript"
+          onClick={function (event) {
+            event.stopPropagation();
+          }}
+        >
+          <div className="cc-history-modal-header">
+            <div className="cc-history-modal-copy">
+              <h3>{preview.title || "Conversation"}</h3>
+              <p>
+                {formatDateLabel(dateKey, timezoneName)}
+                {" \u00b7 "}
+                {formatClockTime(anchorTimestamp, timezoneName)}
+                {" \u00b7 "}
+                {messageCount} message{messageCount === 1 ? "" : "s"}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="cc-history-modal-close"
+              aria-label="Close conversation transcript"
+              onClick={function () {
+                closeConversationSession();
+              }}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+          </div>
+
+          <div className="cc-history-modal-body">
+            {sessionMessages.length === 0 ? (
+              <p className="cc-empty-panel">No messages were saved for this conversation.</p>
+            ) : (
+              sessionMessages.map(function (message) {
+                const isUser = message.role === "user";
+                return (
+                  <div
+                    className={isUser ? "cc-history-msg-row is-user" : "cc-history-msg-row is-agent"}
+                    key={message.id || `${message.role}-${message.created_at}`}
+                  >
+                    <div className={isUser ? "cc-history-msg-avatar is-user" : "cc-history-msg-avatar"}>
+                      {isUser ? "U" : "C"}
+                    </div>
+                    <div className="cc-history-msg-bubble">
+                      <div className="cc-history-msg-text">{message.content || ""}</div>
+                      <div className="cc-history-msg-time">
+                        {formatClockTime(message.created_at, timezoneName)}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   function renderDrawerContent() {
     if (activePanel === "profile") {
       return (
@@ -1554,7 +1943,19 @@ function App() {
               const messageCount = sessionMessages.length || session.message_count || 0;
               const preview = summarizeConversation(sessionMessages);
               return (
-                <article className="cc-session-item" key={(session.session_id || "session") + "-" + index}>
+                <article
+                  className="cc-session-item"
+                  key={(session.session_id || "session") + "-" + index}
+                  role="button"
+                  tabIndex={0}
+                  onClick={function () {
+                    openConversationSession(session);
+                  }}
+                  onKeyDown={function (event) {
+                    handleSessionCardKeyDown(event, session);
+                  }}
+                  aria-label={`Open conversation from ${dateLabel}`}
+                >
                   <span className="cc-session-icon">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
                   </span>
@@ -1628,165 +2029,203 @@ function App() {
     return <p className="cc-empty-panel">Choose a panel from the left menu.</p>;
   }
 
-  return (
-    <div className="cc-shell">
-      <aside className="cc-rail">
-        <div className="cc-rail-logo" aria-label="CuraConnect">C</div>
-        <div className="cc-rail-nav">
-          {NAV_ITEMS.map(function (item) {
-            const isActive = activePanel === item.key;
-            return (
-              <button
-                key={item.key}
-                type="button"
-                className={isActive ? "cc-rail-btn is-active" : "cc-rail-btn"}
-                onClick={function () {
-                  togglePanel(item.key);
-                }}
-                title={item.label}
-                aria-label={item.label}
-              >
-                {renderRailIcon(item.icon)}
-              </button>
-            );
-          })}
-        </div>
-      </aside>
+  const isChatView = activeView === "chat";
 
-      <main className="cc-main">
+  return (
+    <div className={isChatView ? "cc-shell" : "cc-shell cc-shell-wide"}>
+      {isChatView ? (
+        <aside className="cc-rail">
+          <div className="cc-rail-logo" aria-label="CuraConnect">C</div>
+          <div className="cc-rail-nav">
+            {NAV_ITEMS.map(function (item) {
+              const isActive = activePanel === item.key;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  className={isActive ? "cc-rail-btn is-active" : "cc-rail-btn"}
+                  onClick={function () {
+                    togglePanel(item.key);
+                  }}
+                  title={item.label}
+                  aria-label={item.label}
+                >
+                  {renderRailIcon(item.icon)}
+                </button>
+              );
+            })}
+          </div>
+        </aside>
+      ) : null}
+
+      <main className={isChatView ? "cc-main" : "cc-main cc-main-wide"}>
         <header className="cc-topbar">
           <div className="cc-brand">
             <h1>CuraConnect</h1>
-            <p>Daily health check-in</p>
+            <p>{renderViewSubtitle()}</p>
           </div>
           <div className="cc-top-actions">
             <span className={status.mode === "connected" ? "cc-status is-connected" : "cc-status"}>
               {status.text || "Disconnected"}
             </span>
-            <div className="cc-mode-group" role="group" aria-label="Response mode">
-              <button
-                type="button"
-                className={canListen ? "cc-mode-btn is-active" : "cc-mode-btn"}
-                onClick={function () {
-                  setCanListen(true);
-                }}
-                title="Voice replies"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path><path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path></svg>
-                Voice
-              </button>
-              <button
-                type="button"
-                className={!canListen ? "cc-mode-btn is-active" : "cc-mode-btn"}
-                onClick={function () {
-                  setCanListen(false);
-                }}
-                title="Chat replies"
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-                Chat
-              </button>
-            </div>
-            <label className="cc-auto-listen" title="Auto-listen after each reply">
-              Auto-listen
-              <input
-                type="checkbox"
-                checked={autoListenEnabled}
-                onChange={function (e) {
-                  setAutoListenEnabled(e.target.checked);
-                  autoListenEnabledRef.current = e.target.checked;
-                }}
-              />
-              <span className="cc-switch-track"><span className="cc-switch-thumb"></span></span>
-            </label>
+            {isChatView ? (
+              <>
+                <div className="cc-mode-group" role="group" aria-label="Response mode">
+                  <button
+                    type="button"
+                    className={canListen ? "cc-mode-btn is-active" : "cc-mode-btn"}
+                    onClick={function () {
+                      setCanListen(true);
+                    }}
+                    title="Voice replies"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path><path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path></svg>
+                    Voice
+                  </button>
+                  <button
+                    type="button"
+                    className={!canListen ? "cc-mode-btn is-active" : "cc-mode-btn"}
+                    onClick={function () {
+                      setCanListen(false);
+                    }}
+                    title="Chat replies"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                    Chat
+                  </button>
+                </div>
+                <label className="cc-auto-listen" title="Auto-listen after each reply">
+                  Auto-listen
+                  <input
+                    type="checkbox"
+                    checked={autoListenEnabled}
+                    onChange={function (e) {
+                      setAutoListenEnabled(e.target.checked);
+                      autoListenEnabledRef.current = e.target.checked;
+                    }}
+                  />
+                  <span className="cc-switch-track"><span className="cc-switch-thumb"></span></span>
+                </label>
+              </>
+            ) : null}
           </div>
         </header>
 
-        {canListen && (
-          <div className="cc-voice-stage">
-            <button
-              type="button"
-              className={isListening ? "cc-voice-orb is-listening" : "cc-voice-orb"}
-              onClick={toggleVoice}
-              disabled={!micEnabled}
-              title={micHint}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path>
-                <path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path>
-                <path d="M12 19.5v2"></path>
-              </svg>
-            </button>
-            <p className="cc-voice-hint">{isListening ? "Listening..." : "Tap to speak"}</p>
-          </div>
-        )}
-
-        <section className="cc-transcript">
-          {messages.length === 0 && !typing ? (
-            <p className="cc-empty-chat">Type a message or tap the mic to start your health check-in.</p>
-          ) : null}
-
-          {messages.map(function (msg) {
-            const isUser = msg.role === "user";
+        <nav className="cc-view-tabs" aria-label="Primary navigation">
+          {PRIMARY_VIEWS.map(function (item) {
+            const isActive = activeView === item.key;
             return (
-              <div className={isUser ? "cc-msg-row is-user" : "cc-msg-row is-agent"} key={msg.id}>
-                {!isUser ? <div className="cc-msg-avatar">C</div> : null}
-                <div className="cc-msg-bubble">
-                  <div className="cc-msg-text">{msg.text}</div>
-                  <div className="cc-msg-time">{formatLiveMessageTime(msg.createdAt)}</div>
-                </div>
-              </div>
+              <button
+                key={item.key}
+                type="button"
+                className={isActive ? "cc-view-tab is-active" : "cc-view-tab"}
+                onClick={function () {
+                  setActiveView(item.key);
+                }}
+              >
+                {item.label}
+              </button>
             );
           })}
+        </nav>
 
-          {typing ? (
-            <div className="cc-msg-row is-agent" id="typingIndicator">
-              <div className="cc-msg-avatar">C</div>
-              <div className="cc-msg-bubble">
-                <div className="typing">
-                  <span></span>
-                  <span></span>
-                  <span></span>
-                </div>
+        {isChatView ? (
+          <>
+            {canListen && (
+              <div className="cc-voice-stage">
+                <button
+                  type="button"
+                  className={isListening ? "cc-voice-orb is-listening" : "cc-voice-orb"}
+                  onClick={toggleVoice}
+                  disabled={!micEnabled}
+                  title={micHint}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path>
+                    <path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path>
+                    <path d="M12 19.5v2"></path>
+                  </svg>
+                </button>
+                <p className="cc-voice-hint">{isListening ? "Listening..." : "Tap to speak"}</p>
               </div>
-            </div>
-          ) : null}
+            )}
 
-          <div ref={transcriptBottomRef}></div>
-        </section>
+            <section className="cc-transcript">
+              {messages.length === 0 && !typing ? (
+                <p className="cc-empty-chat">Type a message or tap the mic to start your health check-in.</p>
+              ) : null}
 
-        <form className="cc-composer" onSubmit={onSubmit} autoComplete="off">
-          <input
-            type="text"
-            value={inputValue}
-            onChange={function (event) {
-              setInputValue(event.target.value);
-            }}
-            placeholder="Type or tap the mic..."
-          />
-          <button className="cc-send-btn" type="submit" title="Send message">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <line x1="22" y1="2" x2="11" y2="13"></line>
-              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-            </svg>
-          </button>
-          <button
-            className={isListening ? "cc-mic-btn is-listening" : "cc-mic-btn"}
-            type="button"
-            onClick={toggleVoice}
-            disabled={!micEnabled}
-            title={micHint}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path>
-              <path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path>
-              <path d="M12 19.5v2"></path>
-            </svg>
-          </button>
-        </form>
+              {messages.map(function (msg) {
+                const isUser = msg.role === "user";
+                return (
+                  <div className={isUser ? "cc-msg-row is-user" : "cc-msg-row is-agent"} key={msg.id}>
+                    {!isUser ? <div className="cc-msg-avatar">C</div> : null}
+                    <div className="cc-msg-bubble">
+                      <div className="cc-msg-text">{msg.text}</div>
+                      <div className="cc-msg-time">{formatLiveMessageTime(msg.createdAt)}</div>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {typing ? (
+                <div className="cc-msg-row is-agent" id="typingIndicator">
+                  <div className="cc-msg-avatar">C</div>
+                  <div className="cc-msg-bubble">
+                    <div className="typing">
+                      <span></span>
+                      <span></span>
+                      <span></span>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+
+              <div ref={transcriptBottomRef}></div>
+            </section>
+
+            <form className="cc-composer" onSubmit={onSubmit} autoComplete="off">
+              <input
+                type="text"
+                value={inputValue}
+                onChange={function (event) {
+                  setInputValue(event.target.value);
+                }}
+                placeholder="Type or tap the mic..."
+              />
+              <button className="cc-send-btn" type="submit" title="Send message">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <line x1="22" y1="2" x2="11" y2="13"></line>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+              </button>
+              <button
+                className={isListening ? "cc-mic-btn is-listening" : "cc-mic-btn"}
+                type="button"
+                onClick={toggleVoice}
+                disabled={!micEnabled}
+                title={micHint}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 2.5a3.2 3.2 0 0 0-3.2 3.2v7a3.2 3.2 0 0 0 6.4 0v-7A3.2 3.2 0 0 0 12 2.5z"></path>
+                  <path d="M18.3 11.8v1.1a6.3 6.3 0 0 1-12.6 0v-1.1"></path>
+                  <path d="M12 19.5v2"></path>
+                </svg>
+              </button>
+            </form>
+          </>
+        ) : activeView === "dashboard" ? (
+          <section className="cc-view-content">
+            <ClinicDashboard token={authToken} />
+          </section>
+        ) : (
+          <section className="cc-view-content">
+            {renderHealthView()}
+          </section>
+        )}
       </main>
 
-      {activePanel ? (
+      {isChatView && activePanel ? (
         <button
           type="button"
           className="cc-drawer-backdrop"
@@ -1797,22 +2236,26 @@ function App() {
         ></button>
       ) : null}
 
-      <aside className={activePanel ? "cc-drawer is-open" : "cc-drawer"}>
-        <div className="cc-drawer-header">
-          <h2>{PANEL_TITLES[activePanel] || "Panel"}</h2>
-          <button
-            type="button"
-            className="cc-drawer-close"
-            aria-label="Close panel"
-            onClick={function () {
-              setActivePanel(null);
-            }}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-          </button>
-        </div>
-        <div className="cc-drawer-body">{activePanel ? renderDrawerContent() : null}</div>
-      </aside>
+      {isChatView ? (
+        <aside className={activePanel ? "cc-drawer is-open" : "cc-drawer"}>
+          <div className="cc-drawer-header">
+            <h2>{PANEL_TITLES[activePanel] || "Panel"}</h2>
+            <button
+              type="button"
+              className="cc-drawer-close"
+              aria-label="Close panel"
+              onClick={function () {
+                setActivePanel(null);
+              }}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+            </button>
+          </div>
+          <div className="cc-drawer-body">{activePanel ? renderDrawerContent() : null}</div>
+        </aside>
+      ) : null}
+
+      {renderConversationHistoryModal()}
     </div>
   );
 }

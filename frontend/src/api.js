@@ -122,6 +122,169 @@ export function fetchVitalsHistory(token) {
   return request(API_BASE, `/api/vitals/history?token=${encodeURIComponent(token)}`);
 }
 
+export function fetchMedications(token) {
+  return request(API_BASE, `/api/medications?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchMedication(token, medicationId) {
+  return request(API_BASE, `/api/medications/${medicationId}?token=${encodeURIComponent(token)}`);
+}
+
+export function createMedication(token, data) {
+  return request(API_BASE, `/api/medications?token=${encodeURIComponent(token)}`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export function updateMedication(token, medicationId, updates) {
+  return request(API_BASE, `/api/medications/${medicationId}?token=${encodeURIComponent(token)}`, {
+    method: "PATCH",
+    body: JSON.stringify(updates),
+  });
+}
+
+export function logMedicationEvent(token, medicationId, eventData) {
+  return request(API_BASE, `/api/medications/${medicationId}/events?token=${encodeURIComponent(token)}`, {
+    method: "POST",
+    body: JSON.stringify(eventData),
+  });
+}
+
+export function fetchMedicationEvents(token, medicationId) {
+  return request(API_BASE, `/api/medications/${medicationId}/events?token=${encodeURIComponent(token)}`);
+}
+
+export function logSideEffect(token, data) {
+  return request(API_BASE, `/api/side-effects?token=${encodeURIComponent(token)}`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+}
+
+export function fetchSideEffectTimeline(token) {
+  return request(API_BASE, `/api/side-effects/timeline?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchRefills(token) {
+  return request(API_BASE, `/api/refills?token=${encodeURIComponent(token)}`);
+}
+
+export function createRefill(token, medicationId) {
+  return request(API_BASE, `/api/refills?token=${encodeURIComponent(token)}`, {
+    method: "POST",
+    body: JSON.stringify({ medication_id: medicationId }),
+  });
+}
+
+export function updateRefillStatus(token, refillId, status, notes) {
+  return request(API_BASE, `/api/refills/${refillId}?token=${encodeURIComponent(token)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      status,
+      notes: notes || null,
+    }),
+  });
+}
+
+export function fetchPendingRefills(token) {
+  return request(API_BASE, `/api/refills/pending?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchPendingOutreach(token) {
+  return request(API_BASE, `/api/outreach/pending?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchUserOutreach(token) {
+  return request(API_BASE, `/api/outreach/user?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchOutreachStats(token) {
+  return request(API_BASE, `/api/outreach/stats?token=${encodeURIComponent(token)}`);
+}
+
+export function completeOutreach(token, outreachId, outcomeSummary) {
+  return request(API_BASE, `/api/outreach/${outreachId}/complete?token=${encodeURIComponent(token)}`, {
+    method: "POST",
+    body: JSON.stringify({ outcome_summary: outcomeSummary || null }),
+  });
+}
+
+export function cancelOutreach(token, outreachId) {
+  return request(API_BASE, `/api/outreach/${outreachId}/cancel?token=${encodeURIComponent(token)}`, {
+    method: "POST",
+  });
+}
+
+export function fetchOpenEscalations(token) {
+  return request(API_BASE, `/api/escalations?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchUserEscalations(token) {
+  return request(API_BASE, `/api/escalations/user?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchEscalation(token, escalationId) {
+  return request(API_BASE, `/api/escalations/${escalationId}?token=${encodeURIComponent(token)}`);
+}
+
+export function updateEscalationStatus(token, escalationId, status, resolutionNotes) {
+  return request(API_BASE, `/api/escalations/${escalationId}?token=${encodeURIComponent(token)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      status,
+      resolution_notes: resolutionNotes || null,
+    }),
+  });
+}
+
+export function fetchRetentionCurve(token, days = 30) {
+  return request(API_BASE, `/api/analytics/retention?token=${encodeURIComponent(token)}&days=${encodeURIComponent(days)}`);
+}
+
+export function fetchEngagementMetrics(token) {
+  return request(API_BASE, `/api/analytics/engagement?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchRevenueImpact(token, patients, revenue, lift = 10) {
+  return request(
+    API_BASE,
+    `/api/analytics/revenue-impact?token=${encodeURIComponent(token)}&patients=${encodeURIComponent(patients)}&revenue=${encodeURIComponent(revenue)}&lift=${encodeURIComponent(lift)}`
+  );
+}
+
+export function fetchSupportDeflection(token) {
+  return request(API_BASE, `/api/analytics/support-deflection?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchRecentActivity(token, limit = 20) {
+  return request(
+    API_BASE,
+    `/api/activity/recent?token=${encodeURIComponent(token)}&limit=${encodeURIComponent(limit)}`
+  );
+}
+
+export function fetchAuditLog(token, filters = {}) {
+  const params = new URLSearchParams({ token });
+  if (filters.limit != null) {
+    params.set("limit", String(filters.limit));
+  }
+  if (filters.action) {
+    params.set("action", String(filters.action));
+  }
+  if (filters.startDate) {
+    params.set("start_date", String(filters.startDate));
+  }
+  if (filters.endDate) {
+    params.set("end_date", String(filters.endDate));
+  }
+  return request(API_BASE, `/api/audit/log?${params.toString()}`);
+}
+
+export function fetchUserAuditLog(token, userId) {
+  return request(API_BASE, `/api/audit/user/${userId}?token=${encodeURIComponent(token)}`);
+}
+
 export function fetchConversationHistory(token, options = {}) {
   const limitSessions = Number.isFinite(options.limitSessions) ? Number(options.limitSessions) : 25;
   return request(

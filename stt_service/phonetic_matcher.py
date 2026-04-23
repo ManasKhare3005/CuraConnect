@@ -33,6 +33,23 @@ DEFAULT_TERMS = [
     "arizona",
     "playa",
     "norte",
+    "semaglutide",
+    "tirzepatide",
+    "ozempic",
+    "wegovy",
+    "mounjaro",
+    "zepbound",
+    "titration",
+    "subcutaneous",
+    "injection",
+    "nausea",
+    "constipation",
+    "diarrhea",
+    "injection site",
+    "appetite",
+    "refill",
+    "pharmacy",
+    "dosage",
 ]
 
 COMMON_WORDS_TO_SKIP = {
