@@ -10,6 +10,7 @@ from database.models import (
     AuditLog,
     Base,
     ConversationMessage,
+    DoctorRecommendation,
     Escalation,
     Medication,
     MedicationEvent,
@@ -308,6 +309,49 @@ def _ensure_audit_table():
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_log_user_id ON audit_log (user_id)"))
 
 
+def _ensure_doctor_recommendations_table():
+    """Add missing doctor recommendation columns to legacy tables."""
+    inspector = inspect(engine)
+    if "doctor_recommendations" not in inspector.get_table_names():
+        return
+
+    recommendation_columns = {
+        "user_id": "ALTER TABLE doctor_recommendations ADD COLUMN user_id INTEGER",
+        "session_id": "ALTER TABLE doctor_recommendations ADD COLUMN session_id INTEGER",
+        "doctor_name": "ALTER TABLE doctor_recommendations ADD COLUMN doctor_name VARCHAR(200)",
+        "specialty": "ALTER TABLE doctor_recommendations ADD COLUMN specialty VARCHAR(100)",
+        "recommended_for": "ALTER TABLE doctor_recommendations ADD COLUMN recommended_for VARCHAR(100)",
+        "address": "ALTER TABLE doctor_recommendations ADD COLUMN address VARCHAR(500)",
+        "phone": "ALTER TABLE doctor_recommendations ADD COLUMN phone VARCHAR(50)",
+        "place_id": "ALTER TABLE doctor_recommendations ADD COLUMN place_id VARCHAR(200)",
+        "latitude": "ALTER TABLE doctor_recommendations ADD COLUMN latitude FLOAT",
+        "longitude": "ALTER TABLE doctor_recommendations ADD COLUMN longitude FLOAT",
+        "rating": "ALTER TABLE doctor_recommendations ADD COLUMN rating FLOAT",
+        "distance_text": "ALTER TABLE doctor_recommendations ADD COLUMN distance_text VARCHAR(50)",
+        "photo_url": "ALTER TABLE doctor_recommendations ADD COLUMN photo_url VARCHAR(500)",
+        "is_open": "ALTER TABLE doctor_recommendations ADD COLUMN is_open VARCHAR(20)",
+        "created_at": "ALTER TABLE doctor_recommendations ADD COLUMN created_at DATETIME",
+    }
+
+    existing_columns = {column["name"] for column in inspector.get_columns("doctor_recommendations")}
+    statements = [statement for name, statement in recommendation_columns.items() if name not in existing_columns]
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_doctor_recommendations_user_id ON doctor_recommendations (user_id)")
+        )
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_doctor_recommendations_session_id ON doctor_recommendations (session_id)")
+        )
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_doctor_recommendations_place_id ON doctor_recommendations (place_id)")
+        )
+        connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_doctor_recommendations_created_at ON doctor_recommendations (created_at)")
+        )
+
+
 def _parse_json_blob(raw_value: str | None):
     if not isinstance(raw_value, str) or not raw_value.strip():
         return None
@@ -501,6 +545,67 @@ def _serialize_audit_log(entry: AuditLog) -> dict:
     }
 
 
+def _serialize_doctor_recommendation(recommendation: DoctorRecommendation) -> dict:
+    return {
+        "id": recommendation.id,
+        "user_id": recommendation.user_id,
+        "session_id": recommendation.session_id,
+        "doctor_name": recommendation.doctor_name,
+        "specialty": recommendation.specialty,
+        "recommended_for": recommendation.recommended_for,
+        "address": recommendation.address,
+        "phone": recommendation.phone,
+        "place_id": recommendation.place_id,
+        "latitude": recommendation.latitude,
+        "longitude": recommendation.longitude,
+        "rating": recommendation.rating,
+        "distance_text": recommendation.distance_text,
+        "photo_url": recommendation.photo_url,
+        "is_open": recommendation.is_open,
+        "created_at": recommendation.created_at.isoformat() if recommendation.created_at else None,
+    }
+
+
+def _normalize_doctor_open_status(value) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"yes", "open", "true"}:
+            return "yes"
+        if normalized in {"no", "closed", "false"}:
+            return "no"
+    return "unknown"
+
+
+def _doctor_recommendation_lookup_query(db: DBSession, user_id: int, doctor: dict):
+    place_id = str(doctor.get("place_id") or "").strip()
+    if place_id:
+        return (
+            db.query(DoctorRecommendation)
+            .filter(
+                DoctorRecommendation.user_id == user_id,
+                DoctorRecommendation.place_id == place_id,
+            )
+        )
+
+    doctor_name = str(doctor.get("name") or doctor.get("doctor_name") or "").strip()
+    address = str(doctor.get("address") or "").strip()
+    if doctor_name and address:
+        return (
+            db.query(DoctorRecommendation)
+            .filter(
+                DoctorRecommendation.user_id == user_id,
+                DoctorRecommendation.place_id.is_(None),
+                func.lower(DoctorRecommendation.doctor_name) == doctor_name.lower(),
+                func.lower(DoctorRecommendation.address) == address.lower(),
+            )
+        )
+    return None
+
+
 def _as_utc_datetime(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -576,6 +681,7 @@ def init_db():
         _ensure_escalation_table()
         _ensure_refill_table()
         _ensure_audit_table()
+        _ensure_doctor_recommendations_table()
     except OperationalError:
         if DATABASE_URL.startswith("sqlite"):
             raise
@@ -590,6 +696,7 @@ def init_db():
         _ensure_escalation_table()
         _ensure_refill_table()
         _ensure_audit_table()
+        _ensure_doctor_recommendations_table()
 
 
 def get_or_create_user(name: str, age: int | None = None) -> User:
@@ -988,6 +1095,59 @@ def get_side_effects(user_id: int, medication_id: int | None = None) -> list[dic
             query = query.filter(SideEffect.medication_id == medication_id)
         side_effects = query.order_by(SideEffect.reported_at.desc(), SideEffect.id.desc()).all()
         return [_serialize_side_effect(side_effect) for side_effect in side_effects]
+
+
+def resolve_side_effect(side_effect_id: int, user_id: int) -> dict | None:
+    """Mark a side effect as resolved (set resolved_at to now)."""
+    with SessionLocal() as db:
+        effect = (
+            db.query(SideEffect)
+            .filter(
+                SideEffect.id == side_effect_id,
+                SideEffect.user_id == user_id,
+                SideEffect.resolved_at.is_(None),
+            )
+            .first()
+        )
+        if not effect:
+            return None
+        effect.resolved_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(effect)
+        return _serialize_side_effect(effect)
+
+
+def resolve_all_side_effects(user_id: int, medication_id: int | None = None) -> int:
+    """Mark all unresolved side effects as resolved. Returns count resolved."""
+    with SessionLocal() as db:
+        query = db.query(SideEffect).filter(
+            SideEffect.user_id == user_id,
+            SideEffect.resolved_at.is_(None),
+        )
+        if medication_id is not None:
+            query = query.filter(SideEffect.medication_id == medication_id)
+        effects = query.all()
+        count = 0
+        now = datetime.now(timezone.utc)
+        for effect in effects:
+            effect.resolved_at = now
+            count += 1
+        if count > 0:
+            db.commit()
+        return count
+
+
+def get_unresolved_side_effects(user_id: int, medication_id: int | None = None) -> list[dict]:
+    """Get all unresolved (active) side effects for a user."""
+    with SessionLocal() as db:
+        query = db.query(SideEffect).filter(
+            SideEffect.user_id == user_id,
+            SideEffect.resolved_at.is_(None),
+        )
+        if medication_id is not None:
+            query = query.filter(SideEffect.medication_id == medication_id)
+        effects = query.order_by(SideEffect.reported_at.desc(), SideEffect.id.desc()).all()
+        return [_serialize_side_effect(effect) for effect in effects]
 
 
 def get_side_effect_timeline(user_id: int) -> list[dict]:
@@ -1411,6 +1571,139 @@ def get_session_messages(session_id: int, limit: int = 10) -> list[dict]:
         return results
 
 
+def session_belongs_to_user(user_id: int, session_id: int) -> bool:
+    with SessionLocal() as db:
+        session = db.query(Session.id).filter(Session.id == session_id, Session.user_id == user_id).first()
+        return session is not None
+
+
+def save_doctor_recommendations(user_id: int, session_id: int | None, doctors: list[dict]) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    saved_items: list[DoctorRecommendation] = []
+
+    with SessionLocal(expire_on_commit=False) as db:
+        for doctor in doctors or []:
+            if not isinstance(doctor, dict):
+                continue
+
+            doctor_name = str(doctor.get("name") or doctor.get("doctor_name") or "").strip()
+            if not doctor_name:
+                continue
+
+            types = doctor.get("types")
+            primary_type = None
+            if isinstance(types, list) and types:
+                primary_type = str(types[0]).strip() or None
+
+            existing_query = _doctor_recommendation_lookup_query(db, user_id, doctor)
+            existing = existing_query.first() if existing_query is not None else None
+
+            target = existing or DoctorRecommendation(user_id=user_id)
+            target.session_id = session_id
+            target.doctor_name = doctor_name[:200]
+            target.specialty = (
+                str(doctor.get("recommended_for") or primary_type or "").strip()[:100] or None
+            )
+            target.recommended_for = str(doctor.get("recommended_for") or "").strip()[:100] or None
+            target.address = str(doctor.get("address") or "").strip()[:500] or None
+            target.phone = str(doctor.get("phone") or "").strip()[:50] or None
+            target.place_id = str(doctor.get("place_id") or "").strip()[:200] or None
+            target.latitude = doctor.get("latitude")
+            target.longitude = doctor.get("longitude")
+            target.rating = doctor.get("rating")
+            target.distance_text = (
+                str(doctor.get("distance_text") or "").strip()[:50] or None
+            )
+            target.photo_url = str(doctor.get("photo_url") or "").strip()[:500] or None
+            target.is_open = _normalize_doctor_open_status(
+                doctor.get("is_open", doctor.get("open_now"))
+            )
+            target.created_at = now
+
+            if existing is None:
+                db.add(target)
+            saved_items.append(target)
+
+        db.commit()
+        return [_serialize_doctor_recommendation(item) for item in saved_items]
+
+
+def get_doctor_recommendations(user_id: int, limit: int = 20) -> list[dict]:
+    bounded_limit = max(1, min(int(limit), 200))
+    with SessionLocal() as db:
+        recommendations = (
+            db.query(DoctorRecommendation)
+            .filter(DoctorRecommendation.user_id == user_id)
+            .order_by(DoctorRecommendation.created_at.desc(), DoctorRecommendation.id.desc())
+            .limit(bounded_limit)
+            .all()
+        )
+        return [_serialize_doctor_recommendation(recommendation) for recommendation in recommendations]
+
+
+def get_doctor_recommendations_for_session(session_id: int) -> list[dict]:
+    with SessionLocal() as db:
+        recommendations = (
+            db.query(DoctorRecommendation)
+            .filter(DoctorRecommendation.session_id == session_id)
+            .order_by(DoctorRecommendation.created_at.desc(), DoctorRecommendation.id.desc())
+            .all()
+        )
+        return [_serialize_doctor_recommendation(recommendation) for recommendation in recommendations]
+
+
+def delete_doctor_recommendation(user_id: int, recommendation_id: int) -> bool:
+    with SessionLocal() as db:
+        recommendation = (
+            db.query(DoctorRecommendation)
+            .filter(
+                DoctorRecommendation.id == recommendation_id,
+                DoctorRecommendation.user_id == user_id,
+            )
+            .first()
+        )
+        if not recommendation:
+            return False
+        db.delete(recommendation)
+        db.commit()
+        return True
+
+
+def delete_conversation_session(user_id: int, session_id: int) -> bool:
+    with SessionLocal() as db:
+        session = (
+            db.query(Session)
+            .filter(Session.id == session_id, Session.user_id == user_id)
+            .first()
+        )
+        if not session:
+            return False
+
+        (
+            db.query(ScheduledOutreach)
+            .filter(ScheduledOutreach.session_id == session_id)
+            .update({"session_id": None}, synchronize_session=False)
+        )
+        (
+            db.query(Escalation)
+            .filter(Escalation.session_id == session_id)
+            .update({"session_id": None}, synchronize_session=False)
+        )
+        (
+            db.query(DoctorRecommendation)
+            .filter(DoctorRecommendation.session_id == session_id)
+            .update({"session_id": None}, synchronize_session=False)
+        )
+        (
+            db.query(ConversationMessage)
+            .filter(ConversationMessage.session_id == session_id)
+            .delete(synchronize_session=False)
+        )
+        db.delete(session)
+        db.commit()
+        return True
+
+
 def create_escalation(
     user_id: int,
     session_id: int | None,
@@ -1514,6 +1807,7 @@ def delete_user(user_id: int):
         db.query(RefillRequest).filter(RefillRequest.user_id == user_id).delete(synchronize_session=False)
         db.query(Escalation).filter(Escalation.user_id == user_id).delete(synchronize_session=False)
         db.query(ScheduledOutreach).filter(ScheduledOutreach.user_id == user_id).delete(synchronize_session=False)
+        db.query(DoctorRecommendation).filter(DoctorRecommendation.user_id == user_id).delete(synchronize_session=False)
         db.query(MedicationEvent).filter(MedicationEvent.user_id == user_id).delete(synchronize_session=False)
         db.query(SideEffect).filter(SideEffect.user_id == user_id).delete(synchronize_session=False)
         db.query(Medication).filter(Medication.user_id == user_id).delete(synchronize_session=False)
@@ -2119,3 +2413,170 @@ def create_registered_user(
         db.add(user)
         db.commit()
         return user
+
+
+def get_user_by_name(name: str) -> User | None:
+    with SessionLocal(expire_on_commit=False) as db:
+        return db.query(User).filter(User.name.ilike(name.strip())).first()
+
+
+def set_session_timestamps(
+    session_id: int,
+    started_at: datetime | None = None,
+    ended_at: datetime | None = None,
+    summary: str | None = None,
+) -> bool:
+    with SessionLocal() as db:
+        session = db.query(Session).filter(Session.id == session_id).first()
+        if not session:
+            return False
+
+        if started_at is not None:
+            session.started_at = _as_utc_datetime(started_at) or started_at
+        if ended_at is not None:
+            session.ended_at = _as_utc_datetime(ended_at) or ended_at
+        if summary is not None:
+            session.summary = summary
+        db.commit()
+        return True
+
+
+def set_medication_event_timestamps(
+    event_id: int,
+    recorded_at: datetime | None = None,
+    scheduled_at: datetime | None = None,
+) -> dict | None:
+    with SessionLocal(expire_on_commit=False) as db:
+        event = db.query(MedicationEvent).filter(MedicationEvent.id == event_id).first()
+        if not event:
+            return None
+
+        if recorded_at is not None:
+            event.recorded_at = _as_utc_datetime(recorded_at) or recorded_at
+        if scheduled_at is not None:
+            event.scheduled_at = _as_utc_datetime(scheduled_at) or scheduled_at
+        db.commit()
+        db.refresh(event)
+        return _serialize_medication_event(event)
+
+
+def set_side_effect_timestamps(
+    side_effect_id: int,
+    reported_at: datetime | None = None,
+    resolved_at: datetime | None = None,
+    update_resolved_at: bool = False,
+) -> dict | None:
+    with SessionLocal(expire_on_commit=False) as db:
+        side_effect = db.query(SideEffect).filter(SideEffect.id == side_effect_id).first()
+        if not side_effect:
+            return None
+
+        if reported_at is not None:
+            side_effect.reported_at = _as_utc_datetime(reported_at) or reported_at
+        if update_resolved_at:
+            side_effect.resolved_at = _as_utc_datetime(resolved_at) if resolved_at is not None else None
+        db.commit()
+        db.refresh(side_effect)
+        return _serialize_side_effect(side_effect)
+
+
+def set_refill_timestamps(
+    refill_id: int,
+    created_at: datetime | None = None,
+    requested_at: datetime | None = None,
+    flagged_at: datetime | None = None,
+    confirmed_at: datetime | None = None,
+    completed_at: datetime | None = None,
+) -> dict | None:
+    with SessionLocal(expire_on_commit=False) as db:
+        refill = db.query(RefillRequest).filter(RefillRequest.id == refill_id).first()
+        if not refill:
+            return None
+
+        if created_at is not None:
+            refill.created_at = _as_utc_datetime(created_at) or created_at
+        if requested_at is not None:
+            refill.requested_at = _as_utc_datetime(requested_at) or requested_at
+        if flagged_at is not None:
+            refill.flagged_at = _as_utc_datetime(flagged_at) or flagged_at
+        if confirmed_at is not None:
+            refill.confirmed_at = _as_utc_datetime(confirmed_at) or confirmed_at
+        if completed_at is not None:
+            refill.completed_at = _as_utc_datetime(completed_at) or completed_at
+        db.commit()
+        db.refresh(refill)
+        return _serialize_refill_request(refill)
+
+
+def set_outreach_timestamps(
+    outreach_id: int,
+    created_at: datetime | None = None,
+    scheduled_at: datetime | None = None,
+    attempted_at: datetime | None = None,
+    completed_at: datetime | None = None,
+    attempt_count: int | None = None,
+    status: str | None = None,
+    session_id: int | None = None,
+) -> dict | None:
+    with SessionLocal(expire_on_commit=False) as db:
+        outreach = db.query(ScheduledOutreach).filter(ScheduledOutreach.id == outreach_id).first()
+        if not outreach:
+            return None
+
+        if created_at is not None:
+            outreach.created_at = _as_utc_datetime(created_at) or created_at
+        if scheduled_at is not None:
+            outreach.scheduled_at = _as_utc_datetime(scheduled_at) or scheduled_at
+        if attempted_at is not None:
+            outreach.attempted_at = _as_utc_datetime(attempted_at) or attempted_at
+        if completed_at is not None:
+            outreach.completed_at = _as_utc_datetime(completed_at) or completed_at
+        if attempt_count is not None:
+            outreach.attempt_count = int(attempt_count)
+        if status is not None:
+            outreach.status = status.strip().lower()
+        if session_id is not None:
+            outreach.session_id = session_id
+        db.commit()
+        db.refresh(outreach)
+        return _serialize_outreach(outreach)
+
+
+def set_escalation_timestamps(
+    escalation_id: int,
+    created_at: datetime | None = None,
+    acknowledged_at: datetime | None = None,
+    resolved_at: datetime | None = None,
+    status: str | None = None,
+) -> dict | None:
+    with SessionLocal(expire_on_commit=False) as db:
+        escalation = db.query(Escalation).filter(Escalation.id == escalation_id).first()
+        if not escalation:
+            return None
+
+        if created_at is not None:
+            escalation.created_at = _as_utc_datetime(created_at) or created_at
+        if acknowledged_at is not None:
+            escalation.acknowledged_at = _as_utc_datetime(acknowledged_at) or acknowledged_at
+        if resolved_at is not None:
+            escalation.resolved_at = _as_utc_datetime(resolved_at) or resolved_at
+        if status is not None:
+            escalation.status = status.strip().lower()
+        db.commit()
+        db.refresh(escalation)
+        return _serialize_escalation(escalation)
+
+
+def set_doctor_recommendation_created_at(
+    recommendation_id: int,
+    created_at: datetime,
+) -> dict | None:
+    with SessionLocal(expire_on_commit=False) as db:
+        recommendation = db.query(DoctorRecommendation).filter(DoctorRecommendation.id == recommendation_id).first()
+        if not recommendation:
+            return None
+
+        recommendation.created_at = _as_utc_datetime(created_at) or created_at
+        db.commit()
+        db.refresh(recommendation)
+        return _serialize_doctor_recommendation(recommendation)

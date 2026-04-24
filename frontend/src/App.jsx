@@ -2,14 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import {
   checkBackendHealth,
   checkSttHealth,
+  deleteConversationSession,
+  deleteDoctorRecommendation,
   deleteVital,
   enhanceTranscript,
   fetchConversationHistory,
+  fetchDoctorHistory,
   fetchMedication,
   fetchMedications,
   fetchRefills,
+  fetchSessionDoctors,
   fetchSideEffectTimeline,
   fetchVitalsHistory,
+  resolveSideEffect,
   resolveWebSocketUrl,
   transcribeAudioBlob,
 } from "./api";
@@ -101,6 +106,123 @@ function formatClockTime(isoValue, timeZone) {
     return parsed.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   }
 }
+
+function doctorRecommendationKey(record) {
+  const name = String(record?.doctor_name || record?.name || "").trim().toLowerCase();
+  const address = String(record?.address || "").trim().toLowerCase();
+  return String(record?.place_id || `${name}|${address}`);
+}
+
+function buildDoctorMapsUrl(record) {
+  if (record?.maps_url) {
+    return record.maps_url;
+  }
+  if (record?.place_id) {
+    return `https://www.google.com/maps/place/?q=place_id:${encodeURIComponent(record.place_id)}`;
+  }
+  if (record?.latitude != null && record?.longitude != null) {
+    return `https://www.google.com/maps/search/doctor/@${encodeURIComponent(record.latitude)},${encodeURIComponent(record.longitude)},14z`;
+  }
+  const searchQuery = [record?.doctor_name || record?.name, record?.address].filter(Boolean).join(" ");
+  if (!searchQuery) {
+    return "";
+  }
+  return `https://www.google.com/maps/search/${encodeURIComponent(searchQuery)}`;
+}
+
+function normalizeDoctorRecord(record) {
+  const rawTypes = Array.isArray(record?.types) ? record.types : [];
+  const specialty =
+    record?.specialty ||
+    record?.recommended_for ||
+    (rawTypes[0] ? String(rawTypes[0]).replace(/_/g, " ") : "General");
+  const openValue = record?.is_open ?? record?.open_now;
+  let isOpen = "unknown";
+  if (openValue === true) {
+    isOpen = "yes";
+  } else if (openValue === false) {
+    isOpen = "no";
+  } else if (typeof openValue === "string" && openValue.trim()) {
+    const normalized = openValue.trim().toLowerCase();
+    if (normalized === "yes" || normalized === "open" || normalized === "true") {
+      isOpen = "yes";
+    } else if (normalized === "no" || normalized === "closed" || normalized === "false") {
+      isOpen = "no";
+    }
+  }
+
+  return {
+    id: record?.id ?? null,
+    session_id: record?.session_id ?? null,
+    doctor_name: record?.doctor_name || record?.name || "Doctor",
+    specialty,
+    recommended_for: record?.recommended_for || specialty,
+    address: record?.address || "",
+    phone: record?.phone || "",
+    place_id: record?.place_id || null,
+    latitude: record?.latitude ?? null,
+    longitude: record?.longitude ?? null,
+    rating: record?.rating ?? null,
+    distance_text: record?.distance_text || (record?.distance_km ? `${record.distance_km} km` : ""),
+    photo_url: record?.photo_url || "",
+    is_open: isOpen,
+    created_at: record?.created_at || new Date().toISOString(),
+    maps_url: buildDoctorMapsUrl(record),
+  };
+}
+
+function mergeDoctorRecords(currentRecords, nextRecords) {
+  const merged = new Map();
+  currentRecords.forEach(function (record) {
+    merged.set(doctorRecommendationKey(record), record);
+  });
+  nextRecords.forEach(function (record) {
+    merged.set(doctorRecommendationKey(record), record);
+  });
+  return Array.from(merged.values()).sort(function (left, right) {
+    return new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime();
+  });
+}
+
+function groupDoctorHistoryBySession(records, timeZone) {
+  const groups = new Map();
+
+  records.forEach(function (record) {
+    const anchor = record.created_at || null;
+    const dateKey = normalizeIsoToDateKey(anchor, timeZone || undefined);
+    const groupKey = record.session_id ? `session-${record.session_id}` : `saved-${dateKey}`;
+    const existing = groups.get(groupKey);
+
+    if (existing) {
+      existing.items.push(record);
+      const currentTimestamp = new Date(existing.anchor || 0).getTime();
+      const nextTimestamp = new Date(anchor || 0).getTime();
+      if (nextTimestamp > currentTimestamp) {
+        existing.anchor = anchor;
+      }
+      return;
+    }
+
+    groups.set(groupKey, {
+      key: groupKey,
+      session_id: record.session_id,
+      anchor,
+      items: [record],
+    });
+  });
+
+  return Array.from(groups.values())
+    .sort(function (left, right) {
+      return new Date(right.anchor || 0).getTime() - new Date(left.anchor || 0).getTime();
+    })
+    .map(function (group) {
+      const dateKey = normalizeIsoToDateKey(group.anchor, timeZone || undefined);
+      return {
+        ...group,
+        dateLabel: formatDateLabel(dateKey, timeZone || undefined),
+      };
+    });
+}
 import AuthPage from "./AuthPage";
 import ClinicDashboard from "./ClinicDashboard";
 import MedicationCard from "./MedicationCard";
@@ -178,9 +300,14 @@ function App() {
   const [vitals, setVitals] = useState([]);
   const [conversationHistory, setConversationHistory] = useState([]);
   const [doctors, setDoctors] = useState([]);
+  const [savedDoctors, setSavedDoctors] = useState([]);
   const [activeView, setActiveView] = useState("chat");
   const [activePanel, setActivePanel] = useState(null);
   const [selectedConversationSession, setSelectedConversationSession] = useState(null);
+  const [sessionDoctors, setSessionDoctors] = useState([]);
+  const [sessionDoctorsLoading, setSessionDoctorsLoading] = useState(false);
+  const [sessionDoctorsError, setSessionDoctorsError] = useState("");
+  const [deletingConversationId, setDeletingConversationId] = useState(null);
   const [activeMedication, setActiveMedication] = useState(null);
   const [activeRefills, setActiveRefills] = useState([]);
   const [sideEffectTimeline, setSideEffectTimeline] = useState([]);
@@ -209,6 +336,7 @@ function App() {
     setConversationHistory([]);
     setVitals([]);
     setDoctors([]);
+    setSavedDoctors([]);
     setActiveMedication(null);
     setActiveRefills([]);
     setSideEffectTimeline([]);
@@ -216,6 +344,10 @@ function App() {
     setHealthError("");
     setActiveView("chat");
     setSelectedConversationSession(null);
+    setSessionDoctors([]);
+    setSessionDoctorsLoading(false);
+    setSessionDoctorsError("");
+    setDeletingConversationId(null);
     setMessages([]);
     autoListenArmedRef.current = false;
     setActivePanel(null);
@@ -790,6 +922,21 @@ function App() {
     }
   }
 
+  async function refreshDoctorHistory(tokenOverride = null) {
+    const activeToken = tokenOverride || authToken;
+    if (!activeToken) {
+      return;
+    }
+    try {
+      const history = await fetchDoctorHistory(activeToken);
+      if (Array.isArray(history)) {
+        setSavedDoctors(history.map(normalizeDoctorRecord));
+      }
+    } catch (_) {
+      // keep previous recommendations on transient failures
+    }
+  }
+
   async function refreshHealthData(tokenOverride = null, options = {}) {
     const activeToken = tokenOverride || authToken;
     if (!activeToken) {
@@ -851,6 +998,19 @@ function App() {
       setHealthError(nextError);
     }
     setHealthLoading(false);
+  }
+
+  async function handleResolveSideEffect(sideEffectId) {
+    if (!authToken || !sideEffectId) {
+      return null;
+    }
+    const resolved = await resolveSideEffect(authToken, sideEffectId);
+    setSideEffectTimeline(function (currentTimeline) {
+      return (Array.isArray(currentTimeline) ? currentTimeline : []).map(function (entry) {
+        return entry.id === resolved.id ? resolved : entry;
+      });
+    });
+    return resolved;
   }
 
   function sendUserMessage(text) {
@@ -1333,8 +1493,17 @@ function App() {
     }
 
     if (data.type === "doctors_found") {
-      setDoctors(Array.isArray(data.doctors) ? data.doctors : []);
+      const nextDoctors = Array.isArray(data.doctors) ? data.doctors.map(normalizeDoctorRecord) : [];
+      setDoctors(nextDoctors);
+      setSavedDoctors(function (prev) {
+        return mergeDoctorRecords(prev, nextDoctors);
+      });
       setActivePanel("doctors");
+      return;
+    }
+
+    if (data.type === "doctors_saved") {
+      void refreshDoctorHistory();
       return;
     }
 
@@ -1368,13 +1537,15 @@ function App() {
     requestLocation();
 
     if (authToken) {
-      const [vitalsResult, conversationsResult] = await Promise.allSettled([
+      const [vitalsResult, conversationsResult, doctorHistoryResult] = await Promise.allSettled([
         fetchVitalsHistory(authToken),
         fetchConversationHistory(authToken, { limitSessions: 30 }),
+        fetchDoctorHistory(authToken),
       ]);
       const tokenExpired =
         (vitalsResult.status === "rejected" && vitalsResult.reason?.status === 401) ||
-        (conversationsResult.status === "rejected" && conversationsResult.reason?.status === 401);
+        (conversationsResult.status === "rejected" && conversationsResult.reason?.status === 401) ||
+        (doctorHistoryResult.status === "rejected" && doctorHistoryResult.reason?.status === 401);
       if (tokenExpired) {
         handleLogout();
         return;
@@ -1384,6 +1555,9 @@ function App() {
       }
       if (conversationsResult.status === "fulfilled" && Array.isArray(conversationsResult.value)) {
         setConversationHistory(conversationsResult.value);
+      }
+      if (doctorHistoryResult.status === "fulfilled" && Array.isArray(doctorHistoryResult.value)) {
+        setSavedDoctors(doctorHistoryResult.value.map(normalizeDoctorRecord));
       }
     }
     const healthChecks = await Promise.allSettled([checkBackendHealth(), checkSttHealth()]);
@@ -1599,22 +1773,168 @@ function App() {
     } catch (_) {}
   }
 
+  async function handleDeleteConversation(sessionId) {
+    if (!authToken || !sessionId || deletingConversationId === sessionId) {
+      return;
+    }
+
+    const confirmed = window.confirm("Delete this saved conversation? This cannot be undone.");
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingConversationId(sessionId);
+    try {
+      await deleteConversationSession(authToken, sessionId);
+      setConversationHistory(function (prev) {
+        return prev.filter(function (session) {
+          return session.session_id !== sessionId;
+        });
+      });
+      setSelectedConversationSession(function (prev) {
+        if (prev && prev.session_id === sessionId) {
+          return null;
+        }
+        return prev;
+      });
+    } catch (error) {
+      window.alert(error?.message || "Could not delete this conversation right now.");
+    } finally {
+      setDeletingConversationId(null);
+    }
+  }
+
+  async function handleDeleteDoctorRecord(recommendationId) {
+    if (!authToken || !recommendationId) {
+      return;
+    }
+
+    try {
+      await deleteDoctorRecommendation(authToken, recommendationId);
+      setSavedDoctors(function (prev) {
+        return prev.filter(function (record) {
+          return record.id !== recommendationId;
+        });
+      });
+      setSessionDoctors(function (prev) {
+        return prev.filter(function (record) {
+          return record.id !== recommendationId;
+        });
+      });
+      setDoctors(function (prev) {
+        return prev.filter(function (record) {
+          return record.id !== recommendationId;
+        });
+      });
+    } catch (error) {
+      window.alert(error?.message || "Could not remove this recommendation right now.");
+    }
+  }
+
   function groupDoctorsBySpecialty(docs) {
     var groups = {};
     docs.forEach(function (doc) {
-      var key = doc.recommended_for || "General";
+      var key = doc.specialty || doc.recommended_for || "General";
       if (!groups[key]) groups[key] = [];
       groups[key].push(doc);
     });
     return Object.entries(groups);
   }
 
-  function openConversationSession(session) {
+  async function openConversationSession(session) {
     setSelectedConversationSession(session);
+    setSessionDoctors([]);
+    setSessionDoctorsError("");
+
+    if (!authToken || !session?.session_id) {
+      setSessionDoctorsLoading(false);
+      return;
+    }
+
+    setSessionDoctorsLoading(true);
+    try {
+      const results = await fetchSessionDoctors(authToken, session.session_id);
+      setSessionDoctors(Array.isArray(results) ? results.map(normalizeDoctorRecord) : []);
+    } catch (error) {
+      setSessionDoctorsError(error?.message || "Could not load session recommendations.");
+    } finally {
+      setSessionDoctorsLoading(false);
+    }
   }
 
   function closeConversationSession() {
     setSelectedConversationSession(null);
+    setSessionDoctors([]);
+    setSessionDoctorsLoading(false);
+    setSessionDoctorsError("");
+  }
+
+  function renderDoctorCard(doc, options = {}) {
+    const showRemove = Boolean(options.showRemove && doc.id);
+    const showPhoneAction = Boolean(doc.phone);
+    const openLabel =
+      doc.is_open === "yes" ? "Open now" : (doc.is_open === "no" ? "Closed now" : "");
+    const normalizedSpecialty = String(doc.specialty || "").trim().toLowerCase();
+    const normalizedReason = String(doc.recommended_for || "").trim().toLowerCase();
+    const shouldShowReason = Boolean(normalizedReason) && normalizedReason !== normalizedSpecialty;
+
+    return (
+      <article className="cc-doctor-item" key={doctorRecommendationKey(doc)}>
+        <div className="cc-doctor-head">
+          <div>
+            <div className="cc-doctor-name">{doc.doctor_name || "Doctor"}</div>
+            <div className="cc-doctor-specialty">{doc.specialty || "General"}</div>
+          </div>
+          {doc.rating !== undefined && doc.rating !== null ? (
+            <span className="cc-doctor-rating">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="12 2 15.1 8.3 22 9.3 17 14.1 18.2 21 12 17.8 5.8 21 7 14.1 2 9.3 8.9 8.3 12 2"></polygon></svg>
+              {doc.rating}
+            </span>
+          ) : null}
+        </div>
+        <div className="cc-doctor-address">{doc.address || "Address unavailable"}</div>
+        {shouldShowReason ? (
+          <div className="cc-doctor-specialty">Recommended for {doc.recommended_for}</div>
+        ) : null}
+        {doc.distance_text ? (
+          <div className="cc-doctor-distance">{doc.distance_text}</div>
+        ) : null}
+        {openLabel ? (
+          <div className="cc-doctor-distance">{openLabel}</div>
+        ) : null}
+        <div className="cc-doctor-actions">
+          {showPhoneAction ? (
+            <a className="cc-btn-outline" href={`tel:${doc.phone}`}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.4 2.1L8 9.9a16 16 0 0 0 6.1 6.1l1.4-1.4a2 2 0 0 1 2.1-.4c.9.3 1.8.5 2.7.7a2 2 0 0 1 1.7 2z"></path></svg>
+              Call
+            </a>
+          ) : (
+            <button type="button" className="cc-btn-outline" disabled title="Phone unavailable">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.4 2.1L8 9.9a16 16 0 0 0 6.1 6.1l1.4-1.4a2 2 0 0 1 2.1-.4c.9.3 1.8.5 2.7.7a2 2 0 0 1 1.7 2z"></path></svg>
+              Call
+            </button>
+          )}
+          {doc.maps_url ? (
+            <a className="cc-btn-outline" href={doc.maps_url} target="_blank" rel="noopener noreferrer">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="3 11 22 2 13 21 11 13 3 11"></polygon></svg>
+              Directions
+            </a>
+          ) : null}
+          {showRemove ? (
+            <button
+              type="button"
+              className="cc-btn-outline cc-btn-danger"
+              onClick={function () {
+                handleDeleteDoctorRecord(doc.id);
+              }}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+              Remove
+            </button>
+          ) : null}
+        </div>
+      </article>
+    );
   }
 
   function handleSessionCardKeyDown(event, session) {
@@ -1680,7 +2000,11 @@ function App() {
           </div>
         </div>
 
-        <SideEffectTimeline medication={activeMedication} sideEffects={timelineItems} />
+        <SideEffectTimeline
+          medication={activeMedication}
+          sideEffects={timelineItems}
+          onResolve={handleResolveSideEffect}
+        />
 
         <div className="cc-health-secondary-grid">
           <section className="cc-card-shell">
@@ -1788,6 +2112,7 @@ function App() {
     const preview = summarizeConversation(sessionMessages);
     const dateKey = normalizeIsoToDateKey(anchorTimestamp, timezoneName);
     const messageCount = sessionMessages.length || selectedConversationSession.message_count || 0;
+    const isDeletingConversation = deletingConversationId === selectedConversationSession.session_id;
 
     return (
       <div
@@ -1816,16 +2141,29 @@ function App() {
                 {messageCount} message{messageCount === 1 ? "" : "s"}
               </p>
             </div>
-            <button
-              type="button"
-              className="cc-history-modal-close"
-              aria-label="Close conversation transcript"
-              onClick={function () {
-                closeConversationSession();
-              }}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-            </button>
+            <div className="cc-history-modal-actions">
+              <button
+                type="button"
+                className="cc-btn-outline cc-btn-danger"
+                onClick={function () {
+                  handleDeleteConversation(selectedConversationSession.session_id);
+                }}
+                disabled={isDeletingConversation}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1.5 14a2 2 0 0 1-2 1.8H8.5a2 2 0 0 1-2-1.8L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path></svg>
+                {isDeletingConversation ? "Deleting..." : "Delete"}
+              </button>
+              <button
+                type="button"
+                className="cc-history-modal-close"
+                aria-label="Close conversation transcript"
+                onClick={function () {
+                  closeConversationSession();
+                }}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+              </button>
+            </div>
           </div>
 
           <div className="cc-history-modal-body">
@@ -1852,6 +2190,34 @@ function App() {
                 );
               })
             )}
+
+            <section className="cc-history-modal-section">
+              <div className="cc-section-head cc-section-head-tight">
+                <h3>Doctor Recommendations</h3>
+                <p>Recommendations saved during this session.</p>
+              </div>
+
+              {sessionDoctorsLoading ? (
+                <p className="cc-empty-panel">Loading recommendations...</p>
+              ) : sessionDoctorsError ? (
+                <p className="cc-empty-panel">{sessionDoctorsError}</p>
+              ) : sessionDoctors.length === 0 ? (
+                <p className="cc-empty-panel">No doctor recommendations were saved for this session.</p>
+              ) : (
+                <div className="cc-panel-list">
+                  {groupDoctorsBySpecialty(sessionDoctors).map(function ([specialty, docs]) {
+                    return (
+                      <section className="cc-group" key={specialty}>
+                        <h4 className="cc-group-title">{specialty}</h4>
+                        {docs.map(function (doc) {
+                          return renderDoctorCard(doc, { showRemove: true });
+                        })}
+                      </section>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
           </div>
         </div>
       </div>
@@ -1978,45 +2344,27 @@ function App() {
     }
 
     if (activePanel === "doctors") {
+      const doctorHistoryGroups = groupDoctorHistoryBySession(savedDoctors, vitalsTimezone);
       return (
         <div className="cc-panel-list">
-          {doctors.length === 0 ? (
+          <div className="cc-section-head cc-section-head-tight">
+            <h3>Past Recommendations</h3>
+            <p>Saved doctor suggestions from your current and previous conversations.</p>
+          </div>
+          {doctorHistoryGroups.length === 0 ? (
             <p className="cc-empty-panel">No recommendations yet.</p>
           ) : (
-            groupDoctorsBySpecialty(doctors).map(function ([specialty, docs]) {
+            doctorHistoryGroups.map(function (group) {
               return (
-                <section className="cc-group" key={specialty}>
-                  <h3 className="cc-group-title">{specialty}</h3>
-                  {docs.map(function (doc, index) {
-                    return (
-                      <article className="cc-doctor-item" key={(doc.name || "doctor") + "-" + index}>
-                        <div className="cc-doctor-head">
-                          <div className="cc-doctor-name">{doc.name || "Doctor"}</div>
-                          {doc.rating !== undefined && doc.rating !== null ? (
-                            <span className="cc-doctor-rating">
-                              <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="12 2 15.1 8.3 22 9.3 17 14.1 18.2 21 12 17.8 5.8 21 7 14.1 2 9.3 8.9 8.3 12 2"></polygon></svg>
-                              {doc.rating}
-                            </span>
-                          ) : null}
-                        </div>
-                        <div className="cc-doctor-address">{doc.address || "Address unavailable"}</div>
-                        {doc.distance_km ? (
-                          <div className="cc-doctor-distance">{doc.distance_km} km away</div>
-                        ) : null}
-                        <div className="cc-doctor-actions">
-                          <button type="button" className="cc-btn-outline" title="Call">
-                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 16.9v3a2 2 0 0 1-2.2 2A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.4 1.8.7 2.7a2 2 0 0 1-.4 2.1L8 9.9a16 16 0 0 0 6.1 6.1l1.4-1.4a2 2 0 0 1 2.1-.4c.9.3 1.8.5 2.7.7a2 2 0 0 1 1.7 2z"></path></svg>
-                            Call
-                          </button>
-                          {doc.maps_url ? (
-                            <a className="cc-btn-outline" href={doc.maps_url} target="_blank" rel="noopener noreferrer">
-                              <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="3 11 22 2 13 21 11 13 3 11"></polygon></svg>
-                              Directions
-                            </a>
-                          ) : null}
-                        </div>
-                      </article>
-                    );
+                <section className="cc-group" key={group.key}>
+                  <h3 className="cc-group-title">{group.dateLabel}</h3>
+                  <p className="cc-doctor-group-meta">
+                    {group.session_id
+                      ? `Past recommendations from session #${group.session_id}`
+                      : "Past recommendations"}
+                  </p>
+                  {group.items.map(function (doc) {
+                    return renderDoctorCard(doc, { showRemove: true });
                   })}
                 </section>
               );

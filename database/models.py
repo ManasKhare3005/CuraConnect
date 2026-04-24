@@ -40,6 +40,11 @@ class User(Base):
         back_populates="user",
         order_by="RefillRequest.created_at",
     )
+    doctor_recommendations = relationship(
+        "DoctorRecommendation",
+        back_populates="user",
+        order_by="DoctorRecommendation.created_at.desc()",
+    )
 
 
 class Vital(Base):
@@ -79,6 +84,7 @@ class Session(Base):
         back_populates="session",
         order_by="Escalation.created_at",
     )
+    doctor_recommendations = relationship("DoctorRecommendation", back_populates="session")
 
 
 class ConversationMessage(Base):
@@ -257,3 +263,27 @@ class AuditLog(Base):
     ip_address = Column(String(45), nullable=True)
     details = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class DoctorRecommendation(Base):
+    __tablename__ = "doctor_recommendations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=True, index=True)
+    doctor_name = Column(String(200), nullable=False)
+    specialty = Column(String(100), nullable=True)
+    recommended_for = Column(String(100), nullable=True)
+    address = Column(String(500), nullable=True)
+    phone = Column(String(50), nullable=True)
+    place_id = Column(String(200), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    rating = Column(Float, nullable=True)
+    distance_text = Column(String(50), nullable=True)
+    photo_url = Column(String(500), nullable=True)
+    is_open = Column(String(20), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="doctor_recommendations")
+    session = relationship("Session", back_populates="doctor_recommendations")

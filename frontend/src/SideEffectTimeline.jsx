@@ -38,8 +38,30 @@ function getUniqueSymptoms(sideEffects) {
   return names;
 }
 
-export default function SideEffectTimeline({ medication, sideEffects = [] }) {
+function getDurationDays(startValue, endValue) {
+  const start = parseIsoDate(startValue);
+  const end = parseIsoDate(endValue);
+  if (!start || !end) {
+    return null;
+  }
+  const msPerDay = 24 * 60 * 60 * 1000;
+  return Math.max(1, Math.round((end.getTime() - start.getTime()) / msPerDay));
+}
+
+function formatDurationLabel(days) {
+  if (!Number.isFinite(days) || days <= 0) {
+    return null;
+  }
+  if (days === 1) {
+    return "Lasted 1 day";
+  }
+  return `Lasted ${days} days`;
+}
+
+export default function SideEffectTimeline({ medication, sideEffects = [], onResolve = null }) {
   const [selectedEffectId, setSelectedEffectId] = useState(null);
+  const [resolveError, setResolveError] = useState("");
+  const [resolvingId, setResolvingId] = useState(null);
   const effects = Array.isArray(sideEffects) ? sideEffects : [];
   const rows = getUniqueSymptoms(effects);
 
@@ -58,6 +80,21 @@ export default function SideEffectTimeline({ medication, sideEffects = [] }) {
     },
     [effects, selectedEffectId]
   );
+
+  async function handleResolve(effectId) {
+    if (!onResolve || !effectId) {
+      return;
+    }
+    setResolveError("");
+    setResolvingId(effectId);
+    try {
+      await onResolve(effectId);
+    } catch (error) {
+      setResolveError(error?.message || "Could not resolve that side effect right now.");
+    } finally {
+      setResolvingId(null);
+    }
+  }
 
   if (!medication) {
     return (
@@ -91,8 +128,9 @@ export default function SideEffectTimeline({ medication, sideEffects = [] }) {
   const rowHeight = 42;
   const height = Math.max(180, 100 + rows.length * rowHeight);
   const padding = { top: 48, right: 28, bottom: 34, left: 150 };
+  const now = new Date();
   const lastEventDate = effects.reduce(function (latest, entry) {
-    const parsed = parseIsoDate(entry.reported_at);
+    const parsed = parseIsoDate(entry.resolved_at || entry.reported_at) || (!entry.resolved_at ? now : null);
     if (!parsed) {
       return latest;
     }
@@ -100,7 +138,7 @@ export default function SideEffectTimeline({ medication, sideEffects = [] }) {
   }, null);
   const totalWeeks = Math.max(
     4,
-    Math.ceil(getWeeksSinceStart(medication, lastEventDate || new Date())) + 1
+    Math.ceil(getWeeksSinceStart(medication, lastEventDate || now)) + 1
   );
   const milestones = getTitrationMilestones(medication, totalWeeks);
   const selectedEffect =
@@ -120,11 +158,48 @@ export default function SideEffectTimeline({ medication, sideEffects = [] }) {
     return padding.top + rowIndex * rowHeight + rowHeight / 2;
   }
 
+  const plottedEffects = effects
+    .map(function (entry) {
+      const symptomLabel = formatSymptom(entry.symptom);
+      const severity = normalizeSeverity(entry.severity);
+      const reportedAt = parseIsoDate(entry.reported_at);
+      const resolvedAt = parseIsoDate(entry.resolved_at);
+      const endDate = resolvedAt || now;
+      const startWeek = getWeeksSinceStart(medication, reportedAt || medication.start_date);
+      const endWeek = getWeeksSinceStart(medication, endDate);
+      const durationDays = getDurationDays(entry.reported_at, resolvedAt || now);
+      return {
+        ...entry,
+        symptomLabel,
+        severity,
+        y: resolveY(symptomLabel),
+        startX: resolveX(startWeek),
+        endX: resolveX(Math.max(startWeek, endWeek)),
+        isResolved: Boolean(entry.resolved_at),
+        durationDays,
+        durationLabel: resolvedAt ? formatDurationLabel(durationDays) : null,
+      };
+    })
+    .filter(function (entry) {
+      return Number.isFinite(entry.startX) && Number.isFinite(entry.endX);
+    });
+
   return (
     <section className="cc-card-shell">
       <div className="cc-section-head">
         <h3>Side Effect Timeline</h3>
         <p>Track symptoms against titration steps and treatment weeks.</p>
+      </div>
+
+      <div className="set-legend" aria-label="Side effect legend">
+        <span className="set-legend-item">
+          <span className="set-legend-dot is-active" aria-hidden="true" />
+          Active side effect
+        </span>
+        <span className="set-legend-item">
+          <span className="set-legend-dot is-resolved" aria-hidden="true" />
+          Resolved
+        </span>
       </div>
 
       <div className="set-wrap">
@@ -174,11 +249,7 @@ export default function SideEffectTimeline({ medication, sideEffects = [] }) {
             );
           })}
 
-          {effects.map(function (entry) {
-            const symptomLabel = formatSymptom(entry.symptom);
-            const severity = normalizeSeverity(entry.severity);
-            const x = resolveX(getWeeksSinceStart(medication, entry.reported_at));
-            const y = resolveY(symptomLabel);
+          {plottedEffects.map(function (entry) {
             const isActive = selectedEffect && selectedEffect.id === entry.id;
             return (
               <g
@@ -191,15 +262,47 @@ export default function SideEffectTimeline({ medication, sideEffects = [] }) {
                 }}
                 className="set-point-group"
               >
+                <line
+                  x1={entry.startX}
+                  x2={entry.endX}
+                  y1={entry.y}
+                  y2={entry.y}
+                  stroke={SEVERITY_COLORS[entry.severity]}
+                  className={entry.isResolved ? "set-effect-line is-resolved" : "set-effect-line is-active"}
+                />
                 <circle
-                  cx={x}
-                  cy={y}
+                  cx={entry.startX}
+                  cy={entry.y}
                   r={isActive ? 8 : 6}
-                  fill={SEVERITY_COLORS[severity]}
+                  fill={SEVERITY_COLORS[entry.severity]}
                   className={isActive ? "set-point is-active" : "set-point"}
                 >
-                  <title>{`${symptomLabel} (${severity})`}</title>
+                  <title>{`${entry.symptomLabel} (${entry.severity})`}</title>
                 </circle>
+                {entry.isResolved ? (
+                  <circle
+                    cx={entry.endX}
+                    cy={entry.y}
+                    r={isActive ? 7 : 5.5}
+                    className="set-point-resolved"
+                  >
+                    <title>
+                      {entry.durationLabel
+                        ? `${entry.symptomLabel} resolved. ${entry.durationLabel}.`
+                        : `${entry.symptomLabel} resolved.`}
+                    </title>
+                  </circle>
+                ) : (
+                  <circle
+                    cx={entry.endX}
+                    cy={entry.y}
+                    r={isActive ? 8 : 6}
+                    stroke={SEVERITY_COLORS[entry.severity]}
+                    className="set-point-open"
+                  >
+                    <title>{`${entry.symptomLabel} is still active.`}</title>
+                  </circle>
+                )}
               </g>
             );
           })}
@@ -222,7 +325,31 @@ export default function SideEffectTimeline({ medication, sideEffects = [] }) {
                 : "Still active"}
             </span>
             <span>{`Titration step ${selectedEffect.titration_step || "N/A"}`}</span>
+            {selectedEffect.resolved_at ? (
+              <span>{formatDurationLabel(getDurationDays(selectedEffect.reported_at, selectedEffect.resolved_at))}</span>
+            ) : (
+              <span>
+                {`Active for ${getDurationDays(selectedEffect.reported_at, now) || 1} day${
+                  (getDurationDays(selectedEffect.reported_at, now) || 1) === 1 ? "" : "s"
+                }`}
+              </span>
+            )}
           </div>
+          {!selectedEffect.resolved_at && onResolve ? (
+            <div className="set-detail-actions">
+              <button
+                type="button"
+                className="cc-btn-outline"
+                disabled={resolvingId === selectedEffect.id}
+                onClick={function () {
+                  handleResolve(selectedEffect.id);
+                }}
+              >
+                {resolvingId === selectedEffect.id ? "Marking..." : "Mark Resolved"}
+              </button>
+              {resolveError ? <span className="set-error">{resolveError}</span> : null}
+            </div>
+          ) : null}
           {selectedEffect.notes ? <p>{selectedEffect.notes}</p> : null}
         </div>
       ) : null}

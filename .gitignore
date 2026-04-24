@@ -15,3 +15,5 @@ dist/
 .vite/
 public
 .claude
+CLAUDE.md 
+CuraConnect_Natural_Chat_Prompt.md

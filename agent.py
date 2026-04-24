@@ -12,6 +12,8 @@ from services.tts import synthesize_speech
 from services.doctor_finder import find_nearby_doctors
 from services.geocoding import geocode_address
 from services.glp1_protocols import days_until_next_titration, get_current_step, get_next_step, identify_drug
+from services.llm import generate_response
+from services.response_builder import build_response_context
 from services import outreach_scheduler
 
 load_dotenv()
@@ -54,7 +56,9 @@ class ConversationSession:
         self.medication_dose_reported_this_session: bool = False
         self.highest_escalation_severity: str | None = None
         self.refill_prompted_this_session: bool = False
+        self.unresolved_side_effects: list[dict] = []
         self.last_activity_at: datetime = datetime.now(timezone.utc)
+        self.consecutive_vital_declines: int = 0
 
     def set_location(self, latitude: float, longitude: float):
         self.location = {"latitude": latitude, "longitude": longitude}
@@ -109,11 +113,27 @@ class ConversationSession:
         return greeting, audio
 
     async def start_authenticated(self, name: str) -> tuple[str, str | None]:
-        greeting = self._pick(
-            f"Hey {name}, welcome back! How are you feeling today?",
-            f"Hi {name}! Good to see you again. Any symptoms or updates to share?",
-            f"Welcome back, {name}! What can I help you with today?",
-        )
+        if self.active_medication and self.user_id:
+            self._load_unresolved_side_effects()
+        else:
+            self.unresolved_side_effects = []
+        if self.unresolved_side_effects:
+            symptom_names: list[str] = []
+            for effect in self.unresolved_side_effects[:3]:
+                symptom = str(effect.get("symptom") or "").strip()
+                if symptom and symptom not in symptom_names:
+                    symptom_names.append(symptom)
+            symptoms_text = self._format_specialty_list(symptom_names) if symptom_names else "those side effects"
+            greeting = self._pick(
+                f"Hey {name}, welcome back! Last time you mentioned {symptoms_text}. How's that been going?",
+                f"Hi {name}! Good to see you. Any update on the {symptoms_text} you reported?",
+            )
+        else:
+            greeting = self._pick(
+                f"Hey {name}, welcome back! How are you feeling today?",
+                f"Hi {name}! Good to see you again. Any symptoms or updates to share?",
+                f"Welcome back, {name}! What can I help you with today?",
+            )
         audio = await synthesize_speech(greeting)
         return greeting, audio
 
@@ -218,16 +238,22 @@ class ConversationSession:
 
         return "neutral"
 
+    def _first_name(self) -> str | None:
+        full = self.profile.get("name") or self.user_name
+        if not isinstance(full, str) or not full.strip():
+            return None
+        return full.strip().split()[0]
+
     def _tone_preface_for_follow_up(self, tone: str) -> str | None:
-        name = self.profile.get("name")
+        name = self._first_name()
         if tone == "warm":
             if name:
                 return self._pick(
-                    f"Hi {name}, it is good to hear from you.",
+                    f"Hi {name}, good to hear from you.",
                     f"Hey {name}, glad you checked in.",
                 )
             return self._pick(
-                "Hi there, it is good to hear from you.",
+                "Hi there, good to hear from you.",
                 "Hey, glad you checked in.",
             )
         if tone == "concerned":
@@ -247,16 +273,59 @@ class ConversationSession:
             )
         return None
 
-    async def _handle_active_medication_turn(self, entities: dict[str, Any], user_text: str) -> str | None:
+    async def _handle_active_medication_turn(
+        self,
+        entities: dict[str, Any],
+        user_text: str,
+        refill_parts: list[str] | None = None,
+        refill_info: str | None = None,
+        refill_actions: list[str] | None = None,
+    ) -> str | None:
         if not self._has_active_medication_context():
             return None
 
-        response_parts: list[str] = []
+        response_parts: list[str] = list(refill_parts or [])
+        actions_taken: list[str] = list(refill_actions or [])
         handled = False
         display_name = self._medication_display_name()
         scheduled_at = entities.get("recorded_at")
         logged_side_effects: list[str] = []
         logged_medication_vitals = False
+        severity: str | None = None
+        remedy_text: str | None = None
+        escalation_created = False
+        next_question_field: str | None = None
+        updates: dict[str, Any] = {
+            "actions_taken": actions_taken,
+            "fallback_parts": response_parts,
+            "symptoms_added": [],
+            "side_effects_logged": [],
+            "resolved_side_effects": [],
+            "blood_pressure": None,
+            "heart_rate": None,
+            "time_label": entities.get("time_label"),
+            "refill_info": refill_info,
+        }
+        resolved_side_effects = list(entities.get("resolved_side_effects") or [])
+        if not resolved_side_effects:
+            resolved_side_effects = self._check_side_effect_resolution(user_text)
+            if resolved_side_effects:
+                entities["resolved_side_effects"] = list(resolved_side_effects)
+        if resolved_side_effects:
+            entities["symptoms"] = [
+                symptom
+                for symptom in (entities.get("symptoms") or [])
+                if symptom not in resolved_side_effects
+            ]
+            updates["resolved_side_effects"] = list(resolved_side_effects)
+            readable_resolved = self._format_specialty_list(resolved_side_effects)
+            actions_taken.append(f"Marked {readable_resolved} as resolved.")
+            response_parts.append(
+                self._pick(
+                    f"Great news - I've marked your {readable_resolved} as resolved.",
+                    f"Glad to hear that. I marked your {readable_resolved} as resolved.",
+                )
+            )
 
         if entities.get("dose_missed"):
             await self._tool_log_medication_event(
@@ -266,14 +335,16 @@ class ConversationSession:
                 notes="User reported a missed dose during chat.",
             )
             handled = True
+            actions_taken.append(f"Logged a missed {display_name} dose.")
             response_parts.append(self._pick(
                 f"I am sorry that happened. I logged the missed {display_name} dose for you.",
                 f"That is okay. I logged the missed {display_name} dose.",
             ))
-            response_parts.append(self._pick(
+            remedy_text = self._pick(
                 "Try to get back on schedule with guidance from your prescriber.",
                 "Getting back to your regular schedule is usually the next step, but follow your prescriber's plan.",
-            ))
+            )
+            response_parts.append(remedy_text)
         elif entities.get("dose_taken"):
             await self._tool_log_medication_event(
                 event_type="dose_taken",
@@ -282,6 +353,7 @@ class ConversationSession:
                 notes="User reported taking a dose during chat.",
             )
             handled = True
+            actions_taken.append(f"Logged a {display_name} dose as taken.")
             response_parts.append(self._pick(
                 f"Nice work staying on top of your {display_name}. I logged today's dose.",
                 f"Great, I logged your {display_name} dose.",
@@ -289,13 +361,19 @@ class ConversationSession:
 
         if entities.get("dose_question"):
             handled = True
-            response_parts.append(self._build_dose_question_response())
+            dose_summary = self._build_dose_question_response()
+            actions_taken.append(f"Reviewed the current {display_name} dosing schedule.")
+            response_parts.append(dose_summary)
 
         if handled:
             if entities.get("symptoms"):
                 self.symptom_status = "present"
+                active_side_effect_names = {
+                    str(effect.get("symptom") or "").strip().lower()
+                    for effect in self.unresolved_side_effects
+                }
                 for symptom in entities.get("symptoms", []):
-                    if symptom in self.symptoms:
+                    if symptom in self.symptoms or symptom in active_side_effect_names:
                         continue
                     self.symptoms.add(symptom)
                     await self._tool_log_side_effect(symptom, user_text)
@@ -303,6 +381,9 @@ class ConversationSession:
 
             if logged_side_effects:
                 readable = ", ".join(logged_side_effects)
+                updates["symptoms_added"] = list(logged_side_effects)
+                updates["side_effects_logged"] = list(logged_side_effects)
+                actions_taken.append(f"Logged {readable} as side effects linked to {display_name}.")
                 response_parts.append(self._pick(
                     f"I also logged {readable} as a side effect linked to your {display_name}.",
                     f"I noted {readable} as a medication side effect for your {display_name}.",
@@ -318,6 +399,8 @@ class ConversationSession:
                     recorded_at=scheduled_at,
                 )
                 response_parts.append(f"Blood pressure {entities['blood_pressure']} mmHg, noted.")
+                actions_taken.append(f"Logged blood pressure {entities['blood_pressure']} mmHg.")
+                updates["blood_pressure"] = entities["blood_pressure"]
                 logged_medication_vitals = True
 
             if entities.get("heart_rate") is not None:
@@ -330,6 +413,8 @@ class ConversationSession:
                     recorded_at=scheduled_at,
                 )
                 response_parts.append(f"Heart rate {entities['heart_rate']} bpm, got it.")
+                actions_taken.append(f"Logged heart rate {entities['heart_rate']} bpm.")
+                updates["heart_rate"] = entities["heart_rate"]
                 logged_medication_vitals = True
 
             if entities.get("severe_flag"):
@@ -338,26 +423,36 @@ class ConversationSession:
                     "Please seek urgent care right away if that symptom worsens.",
                 ))
 
-            escalation_created = None
             if entities.get("symptoms") or entities.get("severe_flag") or logged_medication_vitals:
                 severity = self._assess_severity()
-                remedy = self._suggest_remedies(severity)
-                if remedy:
-                    response_parts.append(remedy)
-                escalation_created = self._maybe_create_escalation(severity)
+                actions_taken.append(f"Assessed severity as {severity}.")
+                remedy_text = self._suggest_remedies(severity)
+                if remedy_text:
+                    response_parts.append(remedy_text)
+                escalation = self._maybe_create_escalation(severity)
+                escalation_created = bool(escalation)
                 if escalation_created:
+                    actions_taken.append("Created a clinical escalation for the care team.")
                     response_parts.append(
                         "I've flagged this for your care team. They'll have your full history and can follow up with you directly."
                     )
 
             if entities.get("dose_taken") and not logged_side_effects and not escalation_created:
+                next_question_field = "medication_side_effects"
                 response_parts.append(self._pick(
                     "Have you noticed any side effects since the injection, like nausea, constipation, diarrhea, or injection site irritation?",
                     "Any side effects after the injection, such as nausea, constipation, diarrhea, or an injection site reaction?",
                 ))
 
-            merged = " ".join(part.strip() for part in response_parts if part and part.strip())
-            return merged
+            return await self._render_structured_response(
+                updates=updates,
+                entities=entities,
+                severity=severity,
+                escalation_created=escalation_created,
+                remedy_text=remedy_text,
+                next_question_field=next_question_field,
+                refill_parts=refill_parts,
+            )
 
         return None
 
@@ -399,6 +494,14 @@ class ConversationSession:
                 )
 
         entities = self._extract_entities_from_user_text(user_text)
+        resolved_side_effects = self._check_side_effect_resolution(user_text)
+        if resolved_side_effects:
+            entities["resolved_side_effects"] = list(resolved_side_effects)
+            entities["symptoms"] = [
+                symptom
+                for symptom in (entities.get("symptoms") or [])
+                if symptom not in resolved_side_effects
+            ]
         detected_tone = self._detect_conversation_tone(user_text)
         self.conversation_tone = detected_tone
         stop_requested = bool(entities.get("stop_requested"))
@@ -418,12 +521,22 @@ class ConversationSession:
         ):
             entities["dose_missed"] = True
             medication_action_requested = True
+        if "refill_check" in self.prompted_missing_fields:
+            if entities.get("affirmative") and self._has_active_medication_context():
+                entities["refill_request"] = True
+                medication_action_requested = True
+                self.prompted_missing_fields.discard("refill_check")
+            elif entities.get("negative") or skip_response:
+                self.prompted_missing_fields.discard("refill_check")
+        if entities.get("refill_request"):
+            self.prompted_missing_fields.discard("refill_check")
 
         # "nope"/"no"/"skip" with no data — mark last prompted vital as done and move on
         has_any_data = (
             entities.get("blood_pressure")
             or entities.get("heart_rate") is not None
             or entities.get("symptoms")
+            or resolved_side_effects
             or entities.get("name")
             or entities.get("age") is not None
             or medication_action_requested
@@ -452,16 +565,48 @@ class ConversationSession:
             ):
                 self.awaiting_more_help_confirmation = False
 
-        if skip_response and not has_any_data:
-            vital_prompts = ("blood_pressure", "heart_rate", "temperature", "oxygen_saturation")
-            for vp in vital_prompts:
-                if vp in self.prompted_missing_fields and vp not in self.logged_vital_types:
-                    self.logged_vital_types.add(vp)
-                    break
-            follow_up = self._next_scripted_question()
-            return follow_up or self._pick(
+        pending_vital_type = self._next_pending_vital_type()
+        pending_vital_skipped = (
+            not has_any_data
+            and pending_vital_type is not None
+            and (skip_response or entities.get("negative"))
+        )
+
+        if pending_vital_skipped:
+            self.logged_vital_types.add(pending_vital_type)
+            self.consecutive_vital_declines += 1
+            # After 2 consecutive declines, stop asking for vitals and wrap up
+            if self.consecutive_vital_declines >= 2:
+                self.awaiting_more_help_confirmation = True
+                # Mark remaining vitals as skipped so they aren't re-asked
+                for vt in ("blood_pressure", "heart_rate", "temperature", "oxygen_saturation"):
+                    self.prompted_missing_fields.add(vt)
+                wrap_text = self._pick(
+                    "No problem. Is there anything else I can help you with?",
+                    "Got it. Anything else on your mind?",
+                )
+                return await self._render_structured_response(
+                    updates={"fallback_parts": [wrap_text]},
+                    entities=entities,
+                    next_question_field="more_help_confirmation",
+                )
+            follow_up_field, follow_up = self._next_scripted_prompt()
+            if follow_up:
+                return await self._render_structured_response(
+                    updates={
+                        "actions_taken": [f"They do not have a {pending_vital_type.replace('_', ' ')} reading right now."],
+                        "fallback_parts": [follow_up],
+                    },
+                    entities=entities,
+                    next_question_field=follow_up_field,
+                )
+            fallback_text = self._pick(
                 "No problem! Anything else you want to share?",
                 "Got it. Let me know if there is anything else.",
+            )
+            return await self._render_structured_response(
+                updates={"fallback_parts": [fallback_text]},
+                entities=entities,
             )
         recorded_at = entities.get("recorded_at")
         time_label = entities.get("time_label")
@@ -469,6 +614,7 @@ class ConversationSession:
             "profile_changed": {},
             "symptoms_added": [],
             "side_effects_logged": [],
+            "resolved_side_effects": list(resolved_side_effects),
             "vitals_logged": [],
             "blood_pressure": None,
             "heart_rate": None,
@@ -476,7 +622,11 @@ class ConversationSession:
             "symptom_status": None,
             "doctor_preference": None,
             "time_label": time_label,
+            "actions_taken": [],
         }
+        if resolved_side_effects:
+            readable_resolved = self._format_specialty_list(resolved_side_effects)
+            updates["actions_taken"].append(f"Marked {readable_resolved} as resolved.")
 
         # Profile updates (name/age only — weight, height, address are in the profile UI)
         profile_inputs: dict[str, Any] = {}
@@ -485,19 +635,29 @@ class ConversationSession:
         if entities.get("age") is not None:
             profile_inputs["age"] = entities["age"]
 
-        has_structured_data = bool(profile_inputs) or bool(entities.get("symptoms")) or medication_action_requested
+        has_structured_data = (
+            bool(profile_inputs)
+            or bool(entities.get("symptoms"))
+            or bool(resolved_side_effects)
+            or medication_action_requested
+        )
 
         refill_response_parts: list[str] = []
+        refill_info: str | None = None
+        refill_actions: list[str] = []
         refill_handled = False
         if entities.get("refill_request") and self._has_active_medication_context():
             refill_result = await self._handle_refill_request_turn(entities, user_text)
             if isinstance(refill_result, dict):
                 refill_response_parts.extend(refill_result.get("parts") or [])
+                refill_info = str(refill_result.get("info") or "").strip() or None
+                refill_actions = list(refill_result.get("actions_taken") or [])
                 refill_handled = bool(refill_result.get("handled"))
 
         has_non_refill_actions = bool(
             profile_inputs
             or entities.get("symptoms")
+            or resolved_side_effects
             or entities.get("blood_pressure")
             or entities.get("heart_rate") is not None
             or entities.get("dose_taken")
@@ -507,20 +667,28 @@ class ConversationSession:
             or entities.get("doctor_decline")
         )
         if refill_handled and not has_non_refill_actions:
-            merged = " ".join(part.strip() for part in refill_response_parts if part and part.strip())
-            return merged or "I flagged that refill request for your care team."
+            return await self._render_structured_response(
+                updates={
+                    "actions_taken": refill_actions,
+                    "fallback_parts": refill_response_parts,
+                    "refill_info": refill_info,
+                },
+                entities=entities,
+                refill_parts=refill_response_parts,
+            )
 
         medication_entities = dict(entities)
         if refill_handled:
             medication_entities["refill_request"] = False
-        medication_response = await self._handle_active_medication_turn(medication_entities, user_text)
+        medication_response = await self._handle_active_medication_turn(
+            medication_entities,
+            user_text,
+            refill_parts=refill_response_parts,
+            refill_info=refill_info,
+            refill_actions=refill_actions,
+        )
         if medication_response:
-            merged = " ".join(
-                part.strip()
-                for part in [*refill_response_parts, medication_response]
-                if part and part.strip()
-            )
-            return merged
+            return medication_response
 
         if entities.get("doctor_request"):
             self.wants_doctor_suggestions = True
@@ -550,8 +718,12 @@ class ConversationSession:
                 updates["symptom_status"] = "none"
             self.symptom_status = "none"
 
+        active_side_effect_names = {
+            str(effect.get("symptom") or "").strip().lower()
+            for effect in self.unresolved_side_effects
+        }
         for symptom in entities.get("symptoms", []):
-            if symptom in self.symptoms:
+            if symptom in self.symptoms or symptom in active_side_effect_names:
                 continue
             self.symptoms.add(symptom)
             updates["symptoms_added"].append(symptom)
@@ -570,7 +742,7 @@ class ConversationSession:
                 updates["vitals_logged"].append(vital_result)
 
         if entities.get("symptoms") and not updates["symptoms_added"]:
-            known = ", ".join(sorted(self.symptoms))
+            known = ", ".join(sorted({*self.symptoms, *active_side_effect_names}))
             if known:
                 updates["existing_details"].append(f"I still have your symptoms noted: {known}.")
 
@@ -603,11 +775,16 @@ class ConversationSession:
             has_structured_data = True
 
         clarifications: list[str] = []
+        clarification_fields: list[str] = []
         if blood_pressure_mentioned and not blood_pressure:
+            self.prompted_missing_fields.add("blood_pressure")
+            clarification_fields.append("blood_pressure")
             clarifications.append(
                 "I could not read that blood pressure clearly. Please share it as two numbers, like 122 over 78."
             )
         if heart_rate_mentioned and heart_rate is None:
+            self.prompted_missing_fields.add("heart_rate")
+            clarification_fields.append("heart_rate")
             clarifications.append(
                 "I could not read the heart rate clearly. Please share one number in bpm, like 72."
             )
@@ -643,6 +820,9 @@ class ConversationSession:
                 self.doctors_shared = True
 
         response_parts: list[str] = []
+        updates["fallback_parts"] = response_parts
+        if refill_info:
+            updates["refill_info"] = refill_info
         response_parts.extend(refill_response_parts)
         response_parts.extend(self._build_acknowledgements(updates))
 
@@ -655,8 +835,14 @@ class ConversationSession:
 
         if clarifications:
             response_parts.extend(clarifications)
-            merged = " ".join(part.strip() for part in response_parts if part and part.strip())
-            return merged or clarifications[0]
+            updates["clarification_fields"] = clarification_fields
+            next_question_field = clarification_fields[0] if len(clarification_fields) == 1 else None
+            return await self._render_structured_response(
+                updates=updates,
+                entities=entities,
+                next_question_field=next_question_field,
+                refill_parts=refill_response_parts,
+            )
 
         if isinstance(doctor_result, dict):
             if doctor_result.get("status") == "found":
@@ -688,19 +874,41 @@ class ConversationSession:
 
         # Severity assessment + remedy suggestions after new data is logged
         new_data_logged = bool(updates.get("symptoms_added")) or bool(updates.get("blood_pressure")) or updates.get("heart_rate") is not None
-        escalation_created = None
+        severity: str | None = None
+        remedy_text: str | None = None
+        escalation_created = False
         if new_data_logged and (self.symptoms or self.logged_vital_types):
             severity = self._assess_severity()
-            escalation_created = self._maybe_create_escalation(severity)
-            remedy = self._suggest_remedies(severity)
-            if remedy:
-                response_parts.append(remedy)
+            updates["actions_taken"].append(f"Assessed severity as {severity}.")
+            escalation = self._maybe_create_escalation(severity)
+            escalation_created = bool(escalation)
+            remedy_text = self._suggest_remedies(severity)
+            if remedy_text:
+                response_parts.append(remedy_text)
             if escalation_created:
+                updates["actions_taken"].append("Created a clinical escalation for the care team.")
                 response_parts.append(
                     "I've flagged this for your care team. They'll have your full history and can follow up with you directly."
                 )
 
-        follow_up = None if escalation_created else self._next_scripted_question()
+        next_question_field: str | None = None
+        follow_up = None
+        freshly_added_symptoms = updates.get("symptoms_added") or []
+        vitals_just_logged = bool(
+            updates.get("blood_pressure")
+            or updates.get("heart_rate") is not None
+            or any(v.get("vital_type") not in ("symptom", None) for v in (updates.get("vitals_logged") or []))
+        )
+        # When the patient just mentioned symptoms with no vitals, let the LLM
+        # ask a brief follow-up about the symptom rather than immediately pivoting to BP.
+        symptom_pause = (
+            bool(freshly_added_symptoms)
+            and not vitals_just_logged
+            and not escalation_created
+            and not self.vitals_on_cooldown
+        )
+        if not escalation_created and not symptom_pause:
+            next_question_field, follow_up = self._next_scripted_prompt()
         if follow_up:
             if not response_parts and not has_structured_data and not stop_requested and not clarifications:
                 tone_preface = self._tone_preface_for_follow_up(detected_tone)
@@ -708,8 +916,26 @@ class ConversationSession:
                     response_parts.append(tone_preface)
             response_parts.append(follow_up)
 
-        merged = " ".join(part.strip() for part in response_parts if part and part.strip())
-        return merged or "I am here whenever you want to update any health detail."
+        if symptom_pause and freshly_added_symptoms:
+            symptom_names = ", ".join(str(s) for s in freshly_added_symptoms[:3])
+            updates.setdefault("actions_taken", [])
+            updates["actions_taken"].append(f"Logged symptom(s): {symptom_names}.")
+            updates.setdefault("fallback_parts", [])
+            updates["fallback_parts"].append(
+                f"Logged {symptom_names}. Can you tell me more about how that started?"
+            )
+            updates["_symptom_pause"] = symptom_names
+
+        return await self._render_structured_response(
+            updates=updates,
+            entities=entities,
+            severity=severity,
+            escalation_created=escalation_created,
+            remedy_text=remedy_text,
+            next_question_field=next_question_field,
+            doctor_result=doctor_result,
+            refill_parts=refill_response_parts,
+        )
 
     @staticmethod
     def _pick(*options: str) -> str:
@@ -727,10 +953,34 @@ class ConversationSession:
             "All set for now. I am here whenever you need another check-in.",
         )
 
+    async def _render_structured_response(
+        self,
+        updates: dict[str, Any],
+        entities: dict[str, Any],
+        severity: str | None = None,
+        escalation_created: bool = False,
+        remedy_text: str | None = None,
+        next_question_field: str | None = None,
+        doctor_result: dict | None = None,
+        refill_parts: list[str] | None = None,
+    ) -> str:
+        context = build_response_context(
+            session=self,
+            updates=updates,
+            entities=entities,
+            severity=severity,
+            escalation_created=bool(escalation_created),
+            remedy_text=remedy_text,
+            next_question_field=next_question_field,
+            doctor_result=doctor_result,
+            refill_parts=refill_parts,
+        )
+        return await generate_response(context)
+
     def _build_acknowledgements(self, updates: dict[str, Any]) -> list[str]:
         parts: list[str] = []
         changed = updates.get("profile_changed") or {}
-        name = self.profile.get("name")
+        name = self._first_name()
 
         if "name" in changed and "age" in changed:
             parts.append(self._pick(
@@ -759,6 +1009,14 @@ class ConversationSession:
             parts.append(f"Blood pressure {updates['blood_pressure']} mmHg{time_tag}, noted.")
         if updates.get("heart_rate") is not None:
             parts.append(f"Heart rate {updates['heart_rate']} bpm{time_tag}, got it.")
+
+        resolved_side_effects = updates.get("resolved_side_effects") or []
+        if resolved_side_effects:
+            readable_resolved = self._format_specialty_list(resolved_side_effects)
+            parts.append(self._pick(
+                f"Great news - I've marked your {readable_resolved} as resolved.",
+                f"Glad to hear that. I marked your {readable_resolved} as resolved.",
+            ))
 
         symptoms_added = updates.get("symptoms_added") or []
         side_effects_logged = updates.get("side_effects_logged") or []
@@ -804,63 +1062,61 @@ class ConversationSession:
 
         return parts
 
-    def _next_scripted_question(self) -> str:
-        name = self.profile.get("name")
+    def _next_scripted_prompt(self) -> tuple[str | None, str]:
+        name = self._first_name()
 
         if not name:
-            return self._pick(
+            return None, self._pick(
                 "What name should I use for you?",
                 "What is your name?",
                 "First, what should I call you?",
             )
 
         if self.profile.get("age") is None:
-            return self._pick(
+            return "age", self._pick(
                 f"And how old are you, {name}?",
                 f"What is your age, {name}?",
             )
+
+        pending_vital_field, pending_vital_question = self._next_pending_vital_prompt()
+        if pending_vital_question:
+            return pending_vital_field, pending_vital_question
 
         if self._has_active_medication_context() and not self.medication_dose_reported_this_session:
             if "medication_dose" not in self.prompted_missing_fields:
                 self.prompted_missing_fields.add("medication_dose")
                 drug_name = str(self.active_medication.get("drug_name") or "medication")
-                return f"Have you taken your {drug_name} injection this week?"
+                return "medication_dose", f"Have you taken your {drug_name} injection this week?"
 
-        if self._should_prompt_refill_help():
+        should_prompt_refill, refill_message = self._should_prompt_refill()
+        if should_prompt_refill and refill_message:
             self.refill_prompted_this_session = True
-            brand_name = self._medication_display_name()
-            return (
-                f"Your {brand_name} refill should be coming up. "
-                "Is your prescription on track, or do you need help with that?"
-            )
+            self.prompted_missing_fields.add("refill_check")
+            return "refill_check", f"{refill_message} Want me to flag it for your care team?"
 
         if self.symptom_status is None and not self.symptoms:
             if "symptoms" not in self.prompted_missing_fields:
                 self.prompted_missing_fields.add("symptoms")
-                return self._pick(
+                return "symptoms", self._pick(
                     f"How are you feeling today, {name}?",
                     "What brings you in today? Any symptoms?",
                     "How have you been feeling lately?",
                 )
-            # User didn't report symptoms after being asked — treat as no symptoms
-            self.symptom_status = "none"
 
-        # Skip vital questions if recently logged
         if self.vitals_on_cooldown and not self.symptoms:
             self.awaiting_more_help_confirmation = True
-            return self._pick(
+            return "more_help_confirmation", self._pick(
                 "You are all caught up. Is there anything else I can help with?",
                 "Vitals look up to date. Anything else you need?",
             )
 
-        # Symptom-aware vital questions
         has_fever = "fever" in self.symptoms
         has_breathing = "breathlessness" in self.symptoms
 
         if has_fever and "temperature" not in self.logged_vital_types:
             if "temperature" not in self.prompted_missing_fields:
                 self.prompted_missing_fields.add("temperature")
-                return self._pick(
+                return "temperature", self._pick(
                     "Since you mentioned a fever, have you checked your temperature?",
                     "Do you know what your temperature is? That would help track the fever.",
                 )
@@ -868,7 +1124,7 @@ class ConversationSession:
         if has_breathing and "oxygen_saturation" not in self.logged_vital_types:
             if "oxygen_saturation" not in self.prompted_missing_fields:
                 self.prompted_missing_fields.add("oxygen_saturation")
-                return self._pick(
+                return "oxygen_saturation", self._pick(
                     "With the breathing trouble, do you have an oxygen reading? Like from a pulse oximeter?",
                     "If you have a pulse oximeter, your oxygen level would be helpful to log.",
                 )
@@ -876,7 +1132,7 @@ class ConversationSession:
         if "blood_pressure" not in self.logged_vital_types:
             if "blood_pressure" not in self.prompted_missing_fields:
                 self.prompted_missing_fields.add("blood_pressure")
-                return self._pick(
+                return "blood_pressure", self._pick(
                     "Have you checked your blood pressure recently?",
                     "Do you know your blood pressure? Something like 120 over 80.",
                 )
@@ -884,7 +1140,7 @@ class ConversationSession:
         if "heart_rate" not in self.logged_vital_types:
             if "heart_rate" not in self.prompted_missing_fields:
                 self.prompted_missing_fields.add("heart_rate")
-                return self._pick(
+                return "heart_rate", self._pick(
                     "What about your heart rate or pulse?",
                     "Do you know your resting heart rate?",
                 )
@@ -892,13 +1148,13 @@ class ConversationSession:
         if not has_fever and "temperature" not in self.logged_vital_types:
             if "temperature" not in self.prompted_missing_fields:
                 self.prompted_missing_fields.add("temperature")
-                return self._pick(
+                return "temperature", self._pick(
                     "Do you have a temperature reading to log?",
                     "Anything else? I can also note your temperature if you have it.",
                 )
 
         self.awaiting_more_help_confirmation = True
-        return self._pick(
+        return "more_help_confirmation", self._pick(
             "That covers everything for now. Is there anything else I can help you with?",
             "We are all caught up. Is there anything else you would like to add?",
             "You are all set for now. Is there anything else I can help you with today?",
@@ -1714,6 +1970,9 @@ class ConversationSession:
         else:
             return None
 
+        segment = re.sub(r"\b(\d)\s*[:]\s*(\d{2})\b", r"\1\2", segment)
+        segment = re.sub(r"\b(\d{2})\s*[:]\s*(\d)\b", r"\1\2", segment)
+
         numbers = re.findall(r"\d{2,4}", segment)
         for number in numbers:
             value = int(number)
@@ -1877,7 +2136,23 @@ class ConversationSession:
     def _is_skip_response(self, text: str) -> bool:
         lowered = text.lower().strip()
         return bool(re.match(
-            r"^(?:no|nope|nah|skip|pass|not really|don'?t (?:know|have)(?: (?:it|that|one))?|i don'?t)[\s.!]*$",
+            r"^(?:"
+            r"no"
+            r"|nope"
+            r"|nah"
+            r"|skip"
+            r"|pass"
+            r"|not really"
+            r"|no i don'?t"
+            r"|don'?t (?:know|have)(?: (?:it|that|one))?"
+            r"|i don'?t"
+            r"|i do not"
+            r"|i don'?t have(?: [a-z0-9%/\-: ]+)?(?: right now)?"
+            r"|i do not have(?: [a-z0-9%/\-: ]+)?(?: right now)?"
+            r"|i haven'?t checked(?: yet| it)?"
+            r"|haven'?t checked(?: yet| it)?"
+            r"|not right now"
+            r")[\s.!]*$",
             lowered,
         ))
 
@@ -2027,6 +2302,132 @@ class ConversationSession:
             or "medication"
         )
 
+    def _load_unresolved_side_effects(self) -> list[dict]:
+        if self.user_id is None:
+            self.unresolved_side_effects = []
+            return self.unresolved_side_effects
+
+        medication_id = None
+        if self.active_medication and self.active_medication.get("id") is not None:
+            medication_id = int(self.active_medication["id"])
+
+        self.unresolved_side_effects = database.get_unresolved_side_effects(
+            self.user_id,
+            medication_id=medication_id,
+        )
+        return self.unresolved_side_effects
+
+    def _side_effect_resolution_aliases(self, symptom: str) -> list[str]:
+        normalized = str(symptom or "").strip().lower()
+        aliases = {
+            "nausea": ["nausea", "nauseous"],
+            "diarrhea": ["diarrhea"],
+            "constipation": ["constipation", "constipated"],
+            "bloating": ["bloating", "bloated", "gas"],
+            "acid reflux": ["acid reflux", "reflux", "heartburn", "gerd"],
+            "appetite change": ["appetite change", "appetite", "loss of appetite", "no appetite", "not hungry"],
+            "injection site reaction": [
+                "injection site reaction",
+                "injection site",
+                "injection site pain",
+                "injection site redness",
+                "injection site swelling",
+                "injection site bruise",
+                "injection site bruising",
+            ],
+            "stomach pain": ["stomach pain", "abdominal pain", "stomach cramps", "stomach ache"],
+            "hair loss": ["hair loss", "hair thinning", "hair falling out"],
+            "sulfur burps": ["sulfur burps", "sulphur burps", "egg burps"],
+            "gallbladder pain": ["gallbladder pain", "gallbladder", "gallstones"],
+            "pancreatitis": ["pancreatitis", "severe stomach pain"],
+        }.get(normalized, [normalized])
+
+        deduped: list[str] = []
+        for alias in aliases:
+            clean_alias = str(alias or "").strip().lower()
+            if clean_alias and clean_alias not in deduped:
+                deduped.append(clean_alias)
+        return deduped
+
+    def _has_specific_resolution_phrase(self, lowered_text: str, symptom: str) -> bool:
+        for alias in self._side_effect_resolution_aliases(symptom):
+            escaped = re.escape(alias)
+            persistence_patterns = (
+                rf"\bstill\s+{escaped}\b",
+                rf"\bstill\s+(?:have|having|got)\s+{escaped}\b",
+                rf"\b{escaped}\s+(?:is\s+)?(?:still\s+there|not\s+better|worse|getting\s+worse)\b",
+            )
+            if any(re.search(pattern, lowered_text) for pattern in persistence_patterns):
+                continue
+
+            resolution_patterns = (
+                rf"\b{escaped}\s+(?:is\s+)?(?:better|gone|resolved|improved)\b",
+                rf"\b{escaped}\s+went\s+away\b",
+                rf"\b{escaped}\s+stopped\b",
+                rf"\b{escaped}\s+got\s+better\b",
+                rf"\bno\s+more\s+{escaped}\b",
+                rf"\bnot\s+{escaped}\s+anymore\b",
+            )
+            if any(re.search(pattern, lowered_text) for pattern in resolution_patterns):
+                return True
+
+        return False
+
+    def _check_side_effect_resolution(self, user_text: str) -> list[str]:
+        if self.user_id is None:
+            return []
+
+        unresolved = self._load_unresolved_side_effects()
+        if not unresolved:
+            return []
+
+        lowered = user_text.lower()
+        medication_id = int(self.active_medication["id"]) if self.active_medication and self.active_medication.get("id") is not None else None
+
+        resolve_all_patterns = (
+            r"\ball better\b",
+            r"\beverything is fine now\b",
+            r"\bside effects? are gone\b",
+            r"\ball the side effects? are gone\b",
+        )
+        if any(re.search(pattern, lowered) for pattern in resolve_all_patterns):
+            resolved_names = []
+            for effect in unresolved:
+                symptom = str(effect.get("symptom") or "").strip().lower()
+                if symptom and symptom not in resolved_names:
+                    resolved_names.append(symptom)
+                    self.symptoms.discard(symptom)
+            database.resolve_all_side_effects(self.user_id, medication_id=medication_id)
+            self._load_unresolved_side_effects()
+            return resolved_names
+
+        resolved_symptoms: list[str] = []
+        for effect in unresolved:
+            symptom = str(effect.get("symptom") or "").strip().lower()
+            if not symptom:
+                continue
+            if not self._has_specific_resolution_phrase(lowered, symptom):
+                continue
+            resolved = database.resolve_side_effect(int(effect["id"]), self.user_id)
+            if resolved and symptom not in resolved_symptoms:
+                resolved_symptoms.append(symptom)
+                self.symptoms.discard(symptom)
+
+        generic_better = bool(re.search(r"\bfeeling better\b", lowered))
+        if generic_better and not resolved_symptoms:
+            current_symptoms = set(self._extract_symptoms(user_text))
+            if not current_symptoms:
+                recent_effect = unresolved[0]
+                recent_symptom = str(recent_effect.get("symptom") or "").strip().lower()
+                resolved = database.resolve_side_effect(int(recent_effect["id"]), self.user_id)
+                if resolved and recent_symptom:
+                    resolved_symptoms.append(recent_symptom)
+                    self.symptoms.discard(recent_symptom)
+
+        if resolved_symptoms:
+            self._load_unresolved_side_effects()
+        return resolved_symptoms
+
     def _estimate_side_effect_severity(self, symptom: str, text: str) -> str:
         lowered = text.lower()
         severe_patterns = (
@@ -2116,30 +2517,42 @@ class ConversationSession:
             "cancelled": "cancelled",
         }.get(normalized, normalized or "in progress")
 
-    def _should_prompt_refill_help(self) -> bool:
+    def _should_prompt_refill(self) -> tuple[bool, str | None]:
         if not self._has_active_medication_context() or self.user_id is None or self.refill_prompted_this_session:
-            return False
+            return False, None
 
         medication_id = self.active_medication.get("id") if self.active_medication else None
         if medication_id is None:
-            return False
+            return False, None
 
         active_refills = [
             refill for refill in database.get_active_refills(self.user_id)
             if int(refill.get("medication_id") or 0) == int(medication_id)
         ]
         if active_refills:
-            return False
+            return False, None
 
         due_date = database.calculate_next_refill_date(int(medication_id), self.user_id)
         if due_date is None:
-            return False
-        return (due_date - datetime.now(timezone.utc).date()).days <= 5
+            return False, None
+
+        days_until_due = (due_date - datetime.now(timezone.utc).date()).days
+        if days_until_due > 7:
+            return False, None
+
+        brand_name = self._medication_display_name()
+        date_label = f"{due_date.strftime('%b')} {due_date.day}"
+        return True, f"Your {brand_name} refill should be coming up around {date_label}."
+
+    def _should_prompt_refill_help(self) -> bool:
+        should_prompt, _ = self._should_prompt_refill()
+        return should_prompt
 
     async def _handle_refill_request_turn(self, entities: dict[str, Any], user_text: str) -> dict[str, Any] | None:
         if self.user_id is None or not self.active_medication:
             return None
 
+        self.prompted_missing_fields.discard("refill_check")
         medication_id = int(self.active_medication["id"])
         display_name = self._medication_display_name()
         patient_name = self.profile.get("name")
@@ -2193,6 +2606,11 @@ class ConversationSession:
                 return {
                     "handled": True,
                     "parts": [f"{base}{pharmacy_context}"],
+                    "info": f"{display_name} refill flagged for the care team.",
+                    "actions_taken": [
+                        f"Flagged the {display_name} refill for the care team.",
+                        *( [f"Noted {pharmacy_name} as the pharmacy."] if pharmacy_name else [] ),
+                    ],
                 }
 
             if pharmacy_name:
@@ -2215,6 +2633,11 @@ class ConversationSession:
             return {
                 "handled": True,
                 "parts": [f"Your {display_name} refill is {status_phrase}.{pharmacy_context}"],
+                "info": f"Their {display_name} refill is currently {status_phrase}.",
+                "actions_taken": [
+                    f"Reviewed the current refill status for {display_name}: {status_phrase}.",
+                    *( [f"Confirmed {refill['pharmacy_name']} as the pharmacy."] if refill.get("pharmacy_name") else [] ),
+                ],
             }
 
         due_date = database.calculate_next_refill_date(medication_id, self.user_id)
@@ -2263,6 +2686,11 @@ class ConversationSession:
         return {
             "handled": True,
             "parts": [f"{base}{pharmacy_context}"],
+            "info": f"{display_name} refill flagged for the care team.",
+            "actions_taken": [
+                f"Created and flagged a new {display_name} refill request for the care team.",
+                *( [f"Noted {pharmacy_name} as the pharmacy."] if pharmacy_name else [] ),
+            ],
         }
 
     def _build_dose_question_response(self) -> str:
@@ -2326,6 +2754,76 @@ class ConversationSession:
         severe_terms = ("chest pain", "shortness of breath", "breathlessness", "difficulty breathing")
         return any(term in lowered for term in severe_terms)
 
+    def _next_pending_vital_question(self) -> str | None:
+        vital_type = self._next_pending_vital_type()
+        if vital_type is None:
+            return None
+
+        if vital_type == "blood_pressure":
+            return self._pick(
+                "I still need your blood pressure reading. Please share it as two numbers, like 122 over 78.",
+                "Whenever you are ready, send your blood pressure as two numbers, like 122 over 78.",
+            )
+        if vital_type == "heart_rate":
+            return self._pick(
+                "I still need your heart rate. Please share one number in bpm, like 72.",
+                "Whenever you are ready, send your heart rate as one number in bpm, like 72.",
+            )
+        if vital_type == "temperature":
+            return self._pick(
+                "If you have it, please share your temperature reading.",
+                "Whenever you are ready, send your temperature reading.",
+            )
+        if vital_type == "oxygen_saturation":
+            return self._pick(
+                "If you have it, please share your oxygen saturation reading.",
+                "Whenever you are ready, send your oxygen level, like 97 percent.",
+            )
+
+        return None
+
+    def _next_pending_vital_prompt(self) -> tuple[str | None, str | None]:
+        vital_type = self._next_pending_vital_type()
+        if vital_type is None:
+            return None, None
+
+        if vital_type == "blood_pressure":
+            return vital_type, self._pick(
+                "I still need your blood pressure reading. Please share it as two numbers, like 122 over 78.",
+                "Whenever you are ready, send your blood pressure as two numbers, like 122 over 78.",
+            )
+        if vital_type == "heart_rate":
+            return vital_type, self._pick(
+                "I still need your heart rate. Please share one number in bpm, like 72.",
+                "Whenever you are ready, send your heart rate as one number in bpm, like 72.",
+            )
+        if vital_type == "temperature":
+            return vital_type, self._pick(
+                "If you have it, please share your temperature reading.",
+                "Whenever you are ready, send your temperature reading.",
+            )
+        if vital_type == "oxygen_saturation":
+            return vital_type, self._pick(
+                "If you have it, please share your oxygen saturation reading.",
+                "Whenever you are ready, send your oxygen level, like 97 percent.",
+            )
+
+        return None, None
+
+    def _next_pending_vital_type(self) -> str | None:
+        pending_order = (
+            "blood_pressure",
+            "heart_rate",
+            "temperature",
+            "oxygen_saturation",
+        )
+        for vital_type in pending_order:
+            if vital_type not in self.prompted_missing_fields or vital_type in self.logged_vital_types:
+                continue
+            return vital_type
+
+        return None
+
     def _is_waiting_for_vital(self, vital_type: str) -> bool:
         return vital_type in self.prompted_missing_fields and vital_type not in self.logged_vital_types
 
@@ -2385,6 +2883,7 @@ class ConversationSession:
         vital = database.log_vital(self.user_id, vital_type, value, unit, notes, recorded_at=recorded_at)
         self.logged_vital_types.add(vital_type)
         self.logged_vital_values[vital_type] = value
+        self.consecutive_vital_declines = 0
 
         if vital_type == "weight":
             try:
@@ -2457,6 +2956,7 @@ class ConversationSession:
             ),
             notes="User-reported during chat.",
         )
+        self._load_unresolved_side_effects()
         self.events.append({"type": "side_effect_logged", "side_effect": side_effect})
         return {"status": "logged", "side_effect": side_effect}
 
@@ -2618,6 +3118,13 @@ class ConversationSession:
 
         doctors = merged
         self.events.append({"type": "doctors_found", "doctors": doctors})
+        if self.user_id is not None and doctors:
+            saved = database.save_doctor_recommendations(
+                user_id=self.user_id,
+                session_id=self.session_id,
+                doctors=doctors,
+            )
+            self.events.append({"type": "doctors_saved", "count": len(saved)})
 
         if not doctors:
             return {
@@ -2652,6 +3159,10 @@ class ConversationSession:
             active_medications = database.get_active_medications(self.user_id)
             self.active_medication = active_medications[0] if active_medications else None
             self.medication_context_loaded = True
+            if self.active_medication:
+                self._load_unresolved_side_effects()
+            else:
+                self.unresolved_side_effects = []
         database.update_session_user(self.session_id, self.user_id)
         database.attach_session_messages_to_user(self.session_id, self.user_id)
 

@@ -18,10 +18,15 @@ from database import db as database
 from agent import ConversationSession
 from auth import hash_password, verify_password, create_access_token, decode_access_token
 from services.glp1_protocols import identify_drug
-from services import analytics, audit, doctor_finder, geocoding, outreach_scheduler, tts
+from services import analytics, audit, doctor_finder, geocoding, llm, outreach_scheduler, tts
 from stt_service import LocalTranscriber, TranscriptEnhancer
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +38,7 @@ async def lifespan(app: FastAPI):
     tts.http_client = shared_client
     geocoding.http_client = shared_client
     doctor_finder.http_client = shared_client
+    llm.http_client = shared_client
     try:
         yield
     finally:
@@ -784,6 +790,23 @@ async def side_effect_timeline(token: str, request: Request):
         return database.get_side_effect_timeline(user.id)
 
 
+@app.post("/api/side-effects/{side_effect_id}/resolve")
+async def resolve_side_effect(side_effect_id: int, token: str, request: Request):
+    user = _require_authenticated_user(token)
+    with _AuditScope(
+        request,
+        action="resolve_side_effect",
+        resource_type="side_effect",
+        actor_id=user.id,
+        user_id=user.id,
+        resource_id=side_effect_id,
+    ):
+        resolved = database.resolve_side_effect(side_effect_id, user.id)
+        if not resolved:
+            raise HTTPException(status_code=404, detail="Side effect not found.")
+        return resolved
+
+
 @app.get("/api/refills")
 async def list_refills(token: str, request: Request):
     user = _require_authenticated_user(token)
@@ -1277,6 +1300,71 @@ async def conversation_history(token: str, request: Request, limit_sessions: int
         user_id=decoded["sub"],
     ):
         return database.get_conversation_history(decoded["sub"], limit_sessions=bounded_limit)
+
+
+@app.get("/api/doctors/history")
+async def doctor_history(token: str, request: Request, limit: int = 20):
+    user = _require_authenticated_user(token)
+    bounded_limit = max(1, min(int(limit), 100))
+    with _AuditScope(
+        request,
+        action="view_doctor_recommendations",
+        resource_type="doctor_recommendation",
+        actor_id=user.id,
+        user_id=user.id,
+        details=f"limit={bounded_limit}",
+    ):
+        return database.get_doctor_recommendations(user.id, limit=bounded_limit)
+
+
+@app.get("/api/doctors/session/{session_id}")
+async def doctor_history_for_session(session_id: int, token: str, request: Request):
+    user = _require_authenticated_user(token)
+    with _AuditScope(
+        request,
+        action="view_session_doctor_recommendations",
+        resource_type="doctor_recommendation",
+        actor_id=user.id,
+        user_id=user.id,
+        resource_id=session_id,
+    ):
+        if not database.session_belongs_to_user(user.id, session_id):
+            raise HTTPException(status_code=404, detail="Session not found.")
+        return database.get_doctor_recommendations_for_session(session_id)
+
+
+@app.delete("/api/doctors/{recommendation_id}")
+async def delete_doctor_history_item(recommendation_id: int, token: str, request: Request):
+    user = _require_authenticated_user(token)
+    with _AuditScope(
+        request,
+        action="delete_doctor_recommendation",
+        resource_type="doctor_recommendation",
+        actor_id=user.id,
+        user_id=user.id,
+        resource_id=recommendation_id,
+    ):
+        deleted = database.delete_doctor_recommendation(user.id, recommendation_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Doctor recommendation not found.")
+        return {"ok": True, "recommendation_id": recommendation_id}
+
+
+@app.delete("/api/conversations/{session_id}")
+async def delete_conversation(session_id: int, token: str, request: Request):
+    user = _require_authenticated_user(token)
+    with _AuditScope(
+        request,
+        action="delete_conversation",
+        resource_type="conversation",
+        actor_id=user.id,
+        user_id=user.id,
+        resource_id=session_id,
+    ):
+        deleted = database.delete_conversation_session(user.id, session_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return {"ok": True, "session_id": session_id}
 
 
 @app.delete("/api/auth/account")

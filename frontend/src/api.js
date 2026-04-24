@@ -166,6 +166,12 @@ export function fetchSideEffectTimeline(token) {
   return request(API_BASE, `/api/side-effects/timeline?token=${encodeURIComponent(token)}`);
 }
 
+export function resolveSideEffect(token, sideEffectId) {
+  return request(API_BASE, `/api/side-effects/${sideEffectId}/resolve?token=${encodeURIComponent(token)}`, {
+    method: "POST",
+  });
+}
+
 export function fetchRefills(token) {
   return request(API_BASE, `/api/refills?token=${encodeURIComponent(token)}`);
 }
@@ -291,6 +297,26 @@ export function fetchConversationHistory(token, options = {}) {
     API_BASE,
     `/api/conversations/history?token=${encodeURIComponent(token)}&limit_sessions=${encodeURIComponent(limitSessions)}`
   );
+}
+
+export function fetchDoctorHistory(token) {
+  return request(API_BASE, `/api/doctors/history?token=${encodeURIComponent(token)}`);
+}
+
+export function fetchSessionDoctors(token, sessionId) {
+  return request(API_BASE, `/api/doctors/session/${sessionId}?token=${encodeURIComponent(token)}`);
+}
+
+export function deleteDoctorRecommendation(token, recommendationId) {
+  return request(API_BASE, `/api/doctors/${recommendationId}?token=${encodeURIComponent(token)}`, {
+    method: "DELETE",
+  });
+}
+
+export function deleteConversationSession(token, sessionId) {
+  return request(API_BASE, `/api/conversations/${sessionId}?token=${encodeURIComponent(token)}`, {
+    method: "DELETE",
+  });
 }
 
 export function deleteVital(token, vitalId) {
